@@ -1,5 +1,7 @@
 # Assassyn Documentation
 
+> **Quick Start:** For a quick syntax reference, check out [`assassyn基本语法速查.md`](assassyn基本语法速查.md) (Chinese quick reference with examples).
+
 ## Table of Contents
 1. [Introduction](#introduction)
 2. [Core Concepts](#core-concepts)
