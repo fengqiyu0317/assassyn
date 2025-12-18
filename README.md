@@ -4,10 +4,24 @@ Assassyn is a Python-based framework for modeling hardware that allows you to wr
 
 ## Files Overview
 
+- [`assassyn基本语法速查.md`](assassyn基本语法速查.md): **⭐ Quick Reference** - Chinese quick syntax guide with examples (新手推荐！)
+- [`assassyn入门教程.md`](assassyn入门教程.md): Comprehensive Chinese tutorial for getting started with Assassyn
+- [`assassyn_documentation.md`](assassyn_documentation.md): Detailed English documentation explaining Assassyn concepts and API
 - [`assassyn_example.py`](assassyn_example.py): Comprehensive example program demonstrating various Assassyn concepts
-- [`assassyn_documentation.md`](assassyn_documentation.md): Detailed documentation explaining Assassyn concepts and API
-- [`assassyn入门教程.md`](assassyn入门教程.md): Chinese tutorial for getting started with Assassyn
 - [`README.md`](README.md): This file with usage instructions
+
+## Quick Start (快速开始)
+
+**新用户推荐学习路径 / Recommended Learning Path for New Users:**
+
+1. 🚀 **快速入门**: 阅读 [`assassyn基本语法速查.md`](assassyn基本语法速查.md) - 5分钟快速了解基本语法
+2. 📖 **深入学习**: 阅读 [`assassyn入门教程.md`](assassyn入门教程.md) - 全面理解核心概念
+3. 💻 **实践练习**: 运行 [`assassyn_example.py`](assassyn_example.py) - 查看实际应用
+4. 📚 **API参考**: 查阅 [`assassyn_documentation.md`](assassyn_documentation.md) - 详细API文档
+
+**For English Speakers:**
+- Start with [`assassyn_documentation.md`](assassyn_documentation.md) for comprehensive documentation
+- Run [`assassyn_example.py`](assassyn_example.py) to see examples in action
 
 ## Prerequisites
 
@@ -227,8 +241,12 @@ if __name__ == "__main__":
 
 ### Documentation
 
+**For Chinese Readers (中文资源):**
+- [`assassyn基本语法速查.md`](assassyn基本语法速查.md): ⭐ Quick syntax reference with runnable examples (推荐新手从这里开始)
+- [`assassyn入门教程.md`](assassyn入门教程.md): Comprehensive Chinese tutorial with detailed explanations
+
+**For English Readers:**
 - [`assassyn_documentation.md`](assassyn_documentation.md): Comprehensive English documentation
-- [`assassyn入门教程.md`](assassyn入门教程.md): Chinese tutorial with detailed explanations
 
 ### Key Concepts to Master
 
