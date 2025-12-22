@@ -57,7 +57,7 @@ PIPELINE_REGS = Record(
     mem_wb_control=UInt(32),        # 控制信号
     mem_wb_valid=UInt(1),
     mem_wb_mem_data=UInt(XLEN),     # 内存读取的数据
-    mem_wb_ex_result=UInt(XLEN)     # EX阶段的结果
+    mem_wb_ex_result=UInt(XLEN),     # EX阶段的结果
 )
 
 # ==================== 寄存器文件 ===================
@@ -74,16 +74,14 @@ class FetchStage(Module):
     
     @module.combinational
     def build(self, pc, stall, pipeline_regs, instruction_memory, decode_stage):
-        instruction = UInt(XLEN)(0)
+        current_pc = pc[0]
+        word_addr = current_pc >> UInt(XLEN)(2)
+
+        instruction = stall[0].select(UInt(XLEN)(0), instruction_memory[word_addr])
         with Condition(~stall[0]):
-            current_pc = pc[0]
-            word_addr = current_pc >> UInt(XLEN)(2)
-            instruction = instruction_memory[word_addr]
-            
             pipeline_regs[0].if_id_pc = current_pc
-            
             log("IF: PC={:08x}, Instruction={:08x}", current_pc, instruction)
-        
+
         decode_stage.async_called(
             instruction_in=pipeline_regs[0].if_id_instruction,
             if_id_pc_in=pipeline_regs[0].if_id_pc
@@ -105,13 +103,10 @@ class DecodeStage(Module):
         })
     
     @module.combinational
-    def build(self, pipeline_regs, reg_file, execute_stage):
+    def build(self, pipeline_regs, reg_file):
         instruction, if_id_pc_in = self.pop_all_ports(True)
 
-        control_signals = UInt(32)(0)
-        rs1 = UInt(XLEN)(0)
-        rs2 = UInt(XLEN)(0)
-        immediate = UInt(XLEN)(0)
+        
         
         # 如果指令无效，直接返回，不更新ID/EX寄存器
         with Condition(pipeline_regs[0].if_id_valid):
@@ -279,14 +274,20 @@ class DecodeStage(Module):
             
             log("ID: PC={}, Opcode={:07x}, RD={}, RS1={}, RS2={}",
                 if_id_pc_in, opcode, rd, rs1, rs2)
+        
+        with Condition(~pipeline_regs[0].if_id_valid):
+            rs1 = UInt(XLEN)(0)
+            rs2 = UInt(XLEN)(0)
+            immediate = UInt(XLEN)(0)
+            control_signals = UInt(32)(0)
 
-        execute_stage.async_called(
-            pc_in=pipeline_regs[0].id_ex_pc,
-            rs1_idx_in=pipeline_regs[0].id_ex_rs1_idx,
-            rs2_idx_in=pipeline_regs[0].id_ex_rs2_idx,
-            immediate_in=pipeline_regs[0].id_ex_immediate,
-            control_in=pipeline_regs[0].id_ex_control,    # 控制信号
-        )
+        # execute_stage.async_called(
+        #     pc_in=pipeline_regs[0].id_ex_pc,
+        #     rs1_idx_in=pipeline_regs[0].id_ex_rs1_idx,
+        #     rs2_idx_in=pipeline_regs[0].id_ex_rs2_idx,
+        #     immediate_in=pipeline_regs[0].id_ex_immediate,
+        #     control_in=pipeline_regs[0].id_ex_control,    # 控制信号
+        # )
 
         decode_signals = DECODE_SIGNALS.bundle(
             control=control_signals,
@@ -673,8 +674,29 @@ class Driver(Module):
     def __init__(self, program_file="test_program.txt"):
         super().__init__(ports={})
     
+    def init_pipeline_regs(self, pipeline_regs):
+        pipeline_regs[0].if_id_pc = UInt(XLEN)(0)
+        pipeline_regs[0].if_id_instruction = UInt(XLEN)(0)
+        pipeline_regs[0].if_id_valid = UInt(1)(0)
+        pipeline_regs[0].id_ex_pc = UInt(XLEN)(0)
+        pipeline_regs[0].id_ex_control = UInt(32)(0)
+        pipeline_regs[0].id_ex_valid = UInt(1)(0)
+        pipeline_regs[0].id_ex_rs1_idx = UInt(5)(0)
+        pipeline_regs[0].id_ex_rs2_idx = UInt(5)(0)
+        pipeline_regs[0].id_ex_immediate = UInt(XLEN)(0)
+        pipeline_regs[0].ex_mem_pc = UInt(XLEN)(0)
+        pipeline_regs[0].ex_mem_control = UInt(32)(0)
+        pipeline_regs[0].ex_mem_valid = UInt(1)(0)
+        pipeline_regs[0].ex_mem_result = UInt(XLEN)(0)
+        pipeline_regs[0].ex_mem_data = UInt(XLEN)(0)
+        pipeline_regs[0].mem_wb_control = UInt(32)(0)
+        pipeline_regs[0].mem_wb_valid = UInt(1)(0)
+        pipeline_regs[0].mem_wb_mem_data = UInt(XLEN)(0)
+        pipeline_regs[0].mem_wb_ex_result = UInt(XLEN)(0)
+
     @module.combinational
-    def build(self, fetch_stage):
+    def build(self, pipeline_regs, fetch_stage):
+        self.init_pipeline_regs(pipeline_regs)
         fetch_stage.async_called()
         
 def init_memory(self, program_file="test_program.txt"):
@@ -709,27 +731,7 @@ def build_cpu(program_file="test_program.txt"):
     """构建RV32I CPU系统"""
     sys = SysBuilder('rv32i_cpu')
     with sys:
-
-        pipeline_regs = RegArray(PIPELINE_REGS, 1, initializer=[PIPELINE_REGS.bundle(
-            if_id_pc=UInt(XLEN)(0),
-            if_id_instruction=UInt(XLEN)(0),
-            if_id_valid=UInt(1)(0),
-            id_ex_pc=UInt(XLEN)(0),
-            id_ex_control=UInt(32)(0),
-            id_ex_valid=UInt(1)(0),
-            id_ex_rs1_idx=UInt(5)(0),
-            id_ex_rs2_idx=UInt(5)(0),
-            id_ex_immediate=UInt(XLEN)(0),
-            ex_mem_pc=UInt(XLEN)(0),
-            ex_mem_control=UInt(32)(0),
-            ex_mem_valid=UInt(1)(0),
-            ex_mem_result=UInt(XLEN)(0),
-            ex_mem_data=UInt(XLEN)(0),
-            mem_wb_control=UInt(32)(0),
-            mem_wb_valid=UInt(1)(0),
-            mem_wb_mem_data=UInt(XLEN)(0),
-            mem_wb_ex_result=UInt(XLEN)(0)
-        )])
+        pipeline_regs = RegArray(PIPELINE_REGS, 1)
 
         # 创建指令内存
         test_program = init_memory(program_file)
@@ -741,24 +743,24 @@ def build_cpu(program_file="test_program.txt"):
         pc = RegArray(UInt(XLEN), 1, initializer=[0])
         stall = RegArray(UInt(1), 1, initializer=[0])
         
-        hazard_unit = HazardUnit()
+        # hazard_unit = HazardUnit()
         fetch_stage = FetchStage()
         decode_stage = DecodeStage()
-        execute_stage = ExecuteStage()
-        memory_stage = MemoryStage()
-        writeback_stage = WriteBackStage()
+        # execute_stage = ExecuteStage()
+        # memory_stage = MemoryStage()
+        # writeback_stage = WriteBackStage()
         driver = Driver()
 
         # 按照流水线顺序构建模块
-        writeback_stage.build(pipeline_regs, reg_file)
-        memory_stage.build(pipeline_regs, execute_stage, writeback_stage)
-        execute_signals = execute_stage.build(pipeline_regs, reg_file, memory_stage)
-        decode_signals = decode_stage.build(pipeline_regs, reg_file, execute_stage)
+        # writeback_stage.build(pipeline_regs, reg_file)
+        # memory_stage.build(pipeline_regs, execute_stage, writeback_stage)
+        # execute_signals = execute_stage.build(pipeline_regs, reg_file, memory_stage)
+        decode_signals = decode_stage.build(pipeline_regs, reg_file)
         fetch_signals = fetch_stage.build(pc, stall, pipeline_regs, instruction_memory, decode_stage)
-        hazard_unit.build(pc, stall, pipeline_regs, fetch_signals, decode_signals, execute_signals)
+        # hazard_unit.build(pc, stall, pipeline_regs, fetch_signals, decode_signals, execute_signals)
         
         # 构建Driver模块，处理PC更新
-        driver.build(fetch_stage)
+        driver.build(pipeline_regs, fetch_stage)
     
     return sys
 
