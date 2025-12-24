@@ -37,10 +37,7 @@ class FetchStage(Module):
             if_id_valid[0] = UInt(1)(1)
             log("IF: PC={:08x}, Instruction={:08x}", current_pc, instruction)
 
-        decode_stage.async_called(
-            instruction_in=instruction,
-            if_id_pc_in=current_pc,
-        )
+        decode_stage.async_called()
 
         fetch_signals = instruction.bitcast(Bits(XLEN))
         return fetch_signals
@@ -49,16 +46,14 @@ class FetchStage(Module):
 class DecodeStage(Module):
     """指令解码阶段(ID)"""
     def __init__(self):
-        super().__init__(ports={
-            'instruction_in': Port(UInt(XLEN)),  # 输入指令
-            'if_id_pc_in': Port(UInt(XLEN)),  # IF/ID PC输入
-        })
+        super().__init__(ports={})
     
     @module.combinational
-    def build(self, if_id_valid, if_id_pc, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, reg_file, execute_stage):
-        instruction, if_id_pc_in = self.pop_all_ports(True)
+    def build(self, if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, reg_file, execute_stage):
+        if_id_pc_in = if_id_pc[0]
+        instruction = if_id_instruction[0]
 
-        log("IF_ID_VALID={}", if_id_valid[0])
+        log("Instruction={:08x}", instruction)
         
         # 如果指令无效，直接返回，不更新ID/EX寄存器
         opcode = instruction[0:6]          # bits 6:0
@@ -69,11 +64,13 @@ class DecodeStage(Module):
         funct7 = instruction[25:31]         # bits 31:25
 
         # 提取立即数
-        immediate_i = instruction[20:31].sext(Int(32)).bitcast(UInt(32))  # I型立即数
+        immediate_i = instruction[20:31].bitcast(Int(12)).sext(Int(32)).bitcast(UInt(32))  # I型立即数
         immediate_s = concat(instruction[7:11], instruction[25:31]).sext(Int(32)).bitcast(UInt(32))  # S型立即数
         immediate_b = concat(instruction[31:31], instruction[7:7], instruction[25:30], instruction[8:11], UInt(1)(0)).sext(Int(32)).bitcast(UInt(32))  # B型立即数
         immediate_u = (instruction[12:31] << UInt(XLEN)(12)).sext(Int(32)).bitcast(UInt(32))  # U型立即数
         immediate_j = concat(instruction[31:31], instruction[12:19], instruction[20:20], instruction[21:30], UInt(1)(0)).sext(Int(32)).bitcast(UInt(32))  # J型立即数
+
+        log("Immediate_i={}", (immediate_i >> Int(XLEN)(1)))
         
         # 控制信号解码
         alu_op = UInt(5)(0)
@@ -95,9 +92,9 @@ class DecodeStage(Module):
         is_lui_type = (opcode == UInt(7)(0b0110111))
         is_auipc_type = (opcode == UInt(7)(0b0010111))
         alu_op_tmp = UInt(5)(0)
-        alu_op_tmp = ((funct7[5:5] == UInt(1)(1)) & (func3 == UInt(3)(0b000))).select(UInt(5)(0b00001), alu_op_tmp)  # SUB
+        alu_op_tmp = ((is_r_type & funct7[5:5] == UInt(1)(1)) & (func3 == UInt(3)(0b000))).select(UInt(5)(0b00001), alu_op_tmp)  # SUB
         alu_op_tmp = ((funct7[5:5] == UInt(1)(1)) & (func3 == UInt(3)(0b101))).select(UInt(5)(0b00110), alu_op_tmp)  # SRA
-        alu_op_tmp = ((funct7[5:5] == UInt(1)(0)) & (func3 == UInt(3)(0b000))).select(UInt(5)(0b00000), alu_op_tmp)  # ADD
+        alu_op_tmp = (~(is_r_type & funct7[5:5] == UInt(1)(1)) & (func3 == UInt(3)(0b000))).select(UInt(5)(0b00000), alu_op_tmp)  # ADD
         alu_op_tmp = (func3 == UInt(3)(0b111)).select(UInt(5)(0b01001), alu_op_tmp)  # AND
         alu_op_tmp = (func3 == UInt(3)(0b110)).select(UInt(5)(0b01000), alu_op_tmp)  # OR
         alu_op_tmp = (func3 == UInt(3)(0b100)).select(UInt(5)(0b00100), alu_op_tmp)  # XOR
@@ -171,21 +168,15 @@ class DecodeStage(Module):
             id_ex_rs2_idx[0] = rs2
             id_ex_immediate[0] = immediate
             
-            log("ID: PC={}, Opcode={:07x}, RD={}, RS1={}, RS2={}, Immediate={}, Alu_op={}, Branch_op={}, Jump_op={}, Alu_src={}",
-                if_id_pc_in, opcode, rd, rs1, rs2, immediate, alu_op, branch_op, jump_op, alu_src)
+            log("ID: PC={}, Opcode={:07b}, RD={}, RS1={}, RS2={}, Immediate={}, Alu_op={}, Branch_op={}, Jump_op={}, Alu_src={}, Mem_read={}, Mem_write={}, Reg_write={}, Mem_to_reg={}",
+                if_id_pc_in, opcode, rd, rs1, rs2, immediate, alu_op, branch_op, jump_op, alu_src, mem_read, mem_write, reg_write, mem_to_reg)
         
         rs1 = (~if_id_valid[0]).select(Bits(5)(0), rs1)
         rs2 = (~if_id_valid[0]).select(Bits(5)(0), rs2)
         immediate = (~if_id_valid[0]).select(UInt(XLEN)(0), immediate)
         control_signals = (~if_id_valid[0]).select(Bits(CONTROL_LEN)(0), control_signals)
 
-        execute_stage.async_called(
-            pc_in=if_id_pc_in,
-            rs1_idx_in=rs1,
-            rs2_idx_in=rs2,
-            immediate_in=immediate,
-            control_in=control_signals.bitcast(UInt(CONTROL_LEN)),    # 控制信号
-        )
+        execute_stage.async_called()
 
         decode_signals = concat(
             immediate,
@@ -199,13 +190,7 @@ class DecodeStage(Module):
 class ExecuteStage(Module):
     """执行阶段(EX)"""
     def __init__(self):
-        super().__init__(ports={
-            'pc_in': Port(UInt(XLEN)),          # 输入PC
-            'rs1_idx_in': Port(UInt(5)),       # 输入rs1索引
-            'rs2_idx_in': Port(UInt(5)),       # 输入rs2索引
-            'immediate_in': Port(UInt(XLEN)),   # 输入立即数
-            'control_in': Port(UInt(CONTROL_LEN)),     # 输入控制信号
-        })
+        super().__init__(ports={})
     
     def alu_unit(self, op: Value, a: Value, b: Value):
         
@@ -250,9 +235,13 @@ class ExecuteStage(Module):
         return taken
 
     @module.combinational
-    def build(self, id_ex_valid, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage):
-        pc_in, rs1_idx, rs2_idx, immediate_in, control_in = self.pop_all_ports(True)
-        
+    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage):
+        pc_in = id_ex_pc[0]
+        rs1_idx = id_ex_rs1_idx[0]
+        rs2_idx = id_ex_rs2_idx[0]
+        immediate_in = id_ex_immediate[0]
+        control_in = id_ex_control[0]
+
         # 直接从寄存器文件读取rs1和rs2的值
         rs1_data = reg_file[rs1_idx]
         rs2_data = reg_file[rs2_idx]
@@ -304,12 +293,7 @@ class ExecuteStage(Module):
             log("EX: PC={}, ALU_OP={:05b}, Result={:08x}, PC_Change={}, Target_PC={:08x}",
                 pc_in, alu_op, alu_result, pc_change, target_pc)
         
-        memory_stage.async_called(
-            pc_in=pc_in,
-            addr_in=alu_result,  # 直接使用ex_mem_result作为内存地址
-            data_in=rs2_data,
-            control_in=control_in,    # 控制信号
-        )
+        memory_stage.async_called()
 
         execute_signals = concat(
             target_pc,       # [31:1]  目标PC
@@ -322,16 +306,14 @@ class ExecuteStage(Module):
 class MemoryStage(Module):
     """内存访问阶段(MEM)"""
     def __init__(self):
-        super().__init__(ports={
-            'pc_in': Port(UInt(XLEN)),          # 输入PC
-            'addr_in': Port(UInt(XLEN)),        # 输入地址
-            'data_in': Port(UInt(XLEN)),        # 输入数据
-            'control_in': Port(UInt(CONTROL_LEN)),     # 输入控制信号
-        })
+        super().__init__(ports={})
     
     @module.combinational
-    def build(self, ex_mem_valid, ex_mem_result, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram):
-        pc_in, addr_in, data_in, control_in = self.pop_all_ports(True)
+    def build(self, ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram):
+        pc_in = ex_mem_pc[0]
+        addr_in = ex_mem_result[0]
+        data_in = ex_mem_data[0]
+        control_in = ex_mem_control[0]
         
         # 如果指令无效，直接返回，不更新MEM/WB寄存器
         # 解析控制信号
@@ -353,30 +335,23 @@ class MemoryStage(Module):
             mem_wb_valid[0] = UInt(1)(1)
             mem_wb_ex_result[0] = ex_mem_result[0]     # EX/MEM阶段的结果
             
-            log("MEM: PC={}, Addr={:08x}, Read={}, Write={}",
-                pc_in, addr_in, mem_read, mem_write)
+            log("MEM: PC={}, Addr={:08x}, Read={}, Write={}, data_in={}",
+                pc_in, addr_in, mem_read, mem_write, data_in)
 
-        mem_data = mem_read.select(mem_wb_mem_data[0], mem_data)
 
-        writeback_stage.async_called(
-            mem_data_in=mem_data,  # 内存读取的数据
-            ex_result_in=ex_mem_result[0], # EX阶段的结果
-            control_in=control_in,    # 控制信号
-        )
+        writeback_stage.async_called()
 
 # ==================== WB阶段：写回 ===================
 class WriteBackStage(Module):
     """写回阶段(WB)"""
     def __init__(self):
-        super().__init__(ports={
-            'mem_data_in': Port(UInt(XLEN)),    # 输入内存数据
-            'ex_result_in': Port(UInt(XLEN)),   # 输入EX阶段结果
-            'control_in': Port(UInt(CONTROL_LEN)),     # 输入控制信号
-        })
+        super().__init__(ports={})
     
     @module.combinational
-    def build(self, mem_wb_valid, reg_file):
-        mem_data_in, ex_result_in, control_in = self.pop_all_ports(True)
+    def build(self, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file):
+        mem_data_in = mem_wb_mem_data[0]
+        ex_result_in = mem_wb_ex_result[0]
+        control_in = mem_wb_control[0]
         
             # 解析控制信号
         reg_write = control_in[7:7]
@@ -390,8 +365,8 @@ class WriteBackStage(Module):
         # 如果指令无效，直接返回
         with Condition(mem_wb_valid[0]):
             reg_file[wb_rd] = wb_data
-            log("WB: Write_Data={:08x}, RD={}, WE={}",
-                wb_data, control_in[25:29], reg_write)
+            log("WB: Write_Data={}, RD={}, WE={}",
+                wb_data, wb_rd, reg_write)
 
 class HazardUnit(Downstream):
     def __init__(self):
@@ -541,10 +516,10 @@ def build_cpu(program_file="test_program.txt"):
         driver = Driver()
 
         # 按照流水线顺序构建模块
-        writeback_stage.build(mem_wb_valid, reg_file)
-        memory_stage.build(ex_mem_valid, ex_mem_result, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram)
-        execute_signals = execute_stage.build(id_ex_valid, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage)
-        decode_signals = decode_stage.build(if_id_valid, if_id_pc, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, reg_file, execute_stage)
+        writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file)
+        memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram)
+        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage)
+        decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, reg_file, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, instruction_memory, decode_stage)
         hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_control, ex_mem_valid, mem_wb_control, mem_wb_valid, fetch_signals, decode_signals, execute_signals)
         
@@ -558,9 +533,10 @@ def test_rv32i_cpu(program_file="test_program.txt"):
     sys = build_cpu(program_file)
     
     # 生成模拟器
-    simulator_path, _ = elaborate(sys, verilog=False, sim_threshold=5)
+    simulator_path, _ = elaborate(sys, verilog=False, sim_threshold=15)
     raw = utils.run_simulator(simulator_path)
-    print(raw)
+    with open("result.out", 'w', encoding='utf-8') as f:
+        print(raw, file=f)
 
 if __name__ == "__main__":
     test_rv32i_cpu(program_file="test_program.txt")

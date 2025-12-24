@@ -15,7 +15,7 @@ class Driver(Module):
     @module.combinational
     def build(self):
         cnt = RegArray(UInt(8), 2, initializer=[0, 0])
-        cnt = [cnt[0] + UInt(8)(1), cnt[1]]
+        cnt[0] = Int(2)(-1).sext(Int(8)).bitcast(UInt(8))
         # cnt = RegArray(UInt(8), 2, initializer=[cnt[0] + UInt(8)(1), cnt[1]])
         log('Current value: {}', cnt[0])
         return cnt[0]
