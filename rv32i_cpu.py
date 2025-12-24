@@ -333,7 +333,7 @@ class ExecuteStage(Module):
         pc_change = (branch_result.bitcast(Bits(1)) | is_jump | is_jumpr).select(UInt(1)(1), pc_change)
 
         with Condition(is_jump & (immediate_in == UInt(XLEN)(0))):
-            log("Finish Execution.")
+            log("Finish Execution. The result is {}", reg_file[10])
             finish()
         
 
@@ -572,7 +572,7 @@ def build_cpu(program_file="test_program.txt"):
 
         # 创建指令内存
         test_program = init_memory(program_file)
-        instruction_memory = RegArray(UInt(XLEN), 1024, initializer=test_program + [0]*(1024 - len(test_program)))
+        instruction_memory = RegArray(UInt(XLEN), 2048, initializer=test_program + [0]*(2048 - len(test_program)))
         
         # 创建寄存器文件
         reg_file = RegArray(UInt(XLEN), REG_COUNT, initializer=[0]*REG_COUNT)
@@ -580,7 +580,7 @@ def build_cpu(program_file="test_program.txt"):
         pc = RegArray(UInt(XLEN), 1, initializer=[0])
         stall = RegArray(UInt(1), 1, initializer=[0])
         
-        data_sram = SRAM(width=XLEN, depth=65536, init_file=None)
+        data_sram = SRAM(width=XLEN, depth=65536, init_file="data.hex")
         hazard_unit = HazardUnit()
         fetch_stage = FetchStage()
         decode_stage = DecodeStage()
@@ -607,7 +607,7 @@ def test_rv32i_cpu(program_file="test_program.txt"):
     sys = build_cpu(program_file)
     
     # 生成模拟器
-    simulator_path, _ = elaborate(sys, verilog=False, sim_threshold=2500)
+    simulator_path, _ = elaborate(sys, verilog=False, sim_threshold=2500, resource_base='.')
     raw = utils.run_simulator(simulator_path)
     with open("result.out", 'w', encoding='utf-8') as f:
         print(raw, file=f)
