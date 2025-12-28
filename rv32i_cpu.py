@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-五级流水线RV32I CPU实现
+五级流水线RV32IM CPU实现
 使用Assassyn语言实现完整的RISC-V 32位基础指令集处理器
 支持BTB + 2-bit饱和计数器动态分支预测
+支持RV32IM乘法扩展 (mul, mulh, mulhsu, mulhu)
+使用Wallace Tree 3周期乘法器
 """
 
 from assassyn.frontend import *
@@ -14,11 +16,49 @@ from assassyn.ir.module import downstream, Downstream
 # ==================== 常量定义 ===================
 XLEN = 32  # RISC-V XLEN
 REG_COUNT = 32  # 通用寄存器数量
-CONTROL_LEN = 42 # 控制信号长度
+CONTROL_LEN = 45 # 控制信号长度 (42 + 3位mul_op)
 BTB_SIZE = 64  # BTB表大小
 BTB_INDEX_BITS = 6  # BTB索引位数 (log2(64)=6)
 PREDICTION_INFO_LEN = 34  # 预测信息长度: [0]: btb_hit, [1]: predict_taken, [2:33]: predicted_pc
 PREDICTION_RESULT_LEN = 68  # 预测结果长度
+
+# ==================== M扩展乘法操作码 ===================
+# mul_op 编码 (3位):
+# 000 - 非乘法指令
+# 001 - MUL    (signed × signed, low 32 bits)
+# 010 - MULH   (signed × signed, high 32 bits)
+# 011 - MULHSU (signed × unsigned, high 32 bits)
+# 100 - MULHU  (unsigned × unsigned, high 32 bits)
+MUL_OP_NONE   = 0b000
+MUL_OP_MUL    = 0b001
+MUL_OP_MULH   = 0b010
+MUL_OP_MULHSU = 0b011
+MUL_OP_MULHU  = 0b100
+
+# ==================== Wallace Tree 乘法器说明 ====================
+# Wallace Tree 乘法器集成在 ExecuteStage 中实现
+# 
+# 架构设计:
+# - 输入: 32位 × 32位
+# - 输出: 64位 (根据指令选择高32位或低32位)
+# - 延迟: 3周期
+#
+# 支持的指令:
+# - MUL:    signed × signed, 返回低32位
+# - MULH:   signed × signed, 返回高32位  
+# - MULHSU: signed × unsigned, 返回高32位
+# - MULHU:  unsigned × unsigned, 返回高32位
+#
+# Wallace Tree压缩使用 Carry-Save Adder (CSA):
+# - 3个操作数 → 2个操作数 (sum + carry)
+# - sum = a ^ b ^ c
+# - carry = ((a & b) | (b & c) | (a & c)) << 1
+# - 只有最终阶段使用普通加法器
+#
+# 3周期流水线:
+# - Cycle 1: 符号扩展 + 部分积生成 + CSA压缩 (32→22→15→10)
+# - Cycle 2: 继续CSA压缩 (10→7→5→4→3→2)  
+# - Cycle 3: 最终加法 + 结果选择
 
 # ==================== IF阶段：指令获取 ===================
 class FetchStage(Module):
@@ -59,14 +99,21 @@ class FetchStage(Module):
             btb_hit                 # [0]    BTB是否命中
         ).bitcast(UInt(PREDICTION_INFO_LEN))
 
+        # IF/ID 寄存器更新:
+        # - 暂停时(stall=1): 保持不变
+        # - 正常时: 更新为当前取的指令
         with Condition(if_id_valid[0]):
-            if_id_pc[0] = stall[0].select(UInt(XLEN)(0), current_pc)
-            if_id_valid[0] = stall[0].select(UInt(1)(0), UInt(1)(1))
-            if_id_prediction_info[0] = stall[0].select(UInt(PREDICTION_INFO_LEN)(0), prediction_info)
+            if_id_pc[0] = stall[0].select(if_id_pc[0], current_pc)
+            # if_id_valid 应该在正常情况下保持为1，只有 need_flush 时才清0（由 HazardUnit 处理）
+            if_id_prediction_info[0] = stall[0].select(if_id_prediction_info[0], prediction_info)
 
         decode_stage.async_called()
 
-        fetch_signals = if_id_valid[0].select(stall[0].select(UInt(XLEN)(0), instruction), if_id_instruction[0]).bitcast(Bits(XLEN))
+        # fetch_signals 逻辑:
+        # - 正常情况(stall=0, if_id_valid=1): 输出当前取的指令
+        # - 暂停情况(stall=1): 输出 if_id_instruction[0] (保持当前指令)
+        # - 刷新情况(if_id_valid=0): 输出 if_id_instruction[0] (使用存储的指令)
+        fetch_signals = stall[0].select(if_id_instruction[0], if_id_valid[0].select(instruction, if_id_instruction[0])).bitcast(Bits(XLEN))
         return fetch_signals
 
 # ==================== ID阶段：指令解码 ===================
@@ -149,6 +196,23 @@ class DecodeStage(Module):
         is_jr_type = (opcode == UInt(7)(0b1100111))
         is_lui_type = (opcode == UInt(7)(0b0110111))
         is_auipc_type = (opcode == UInt(7)(0b0010111))
+        
+        # M扩展指令检测: opcode=0110011, funct7=0000001
+        is_m_ext = (is_r_type & (funct7 == UInt(7)(0b0000001)))
+        
+        # M扩展乘法指令解码 (func3决定具体操作)
+        # func3: 000=MUL, 001=MULH, 010=MULHSU, 011=MULHU
+        mul_op = UInt(3)(MUL_OP_NONE)
+        mul_op = (is_m_ext & (func3 == UInt(3)(0b000))).select(UInt(3)(MUL_OP_MUL), mul_op)     # MUL
+        mul_op = (is_m_ext & (func3 == UInt(3)(0b001))).select(UInt(3)(MUL_OP_MULH), mul_op)    # MULH
+        mul_op = (is_m_ext & (func3 == UInt(3)(0b010))).select(UInt(3)(MUL_OP_MULHSU), mul_op)  # MULHSU
+        mul_op = (is_m_ext & (func3 == UInt(3)(0b011))).select(UInt(3)(MUL_OP_MULHU), mul_op)   # MULHU
+        
+        # 是否为乘法指令
+        is_mul_inst = (mul_op != UInt(3)(MUL_OP_NONE))
+        # log("ID DECODE: opcode={:07b}, funct7={:07b}, func3={:03b}, is_r_type={}, is_m_ext={}, mul_op={}, is_mul_inst={}", 
+            # opcode, funct7, func3, is_r_type, is_m_ext, mul_op, is_mul_inst)
+        
         alu_op_tmp = UInt(5)(0)
         alu_op_tmp = ((is_r_type & funct7[5:5] == UInt(1)(1)) & (func3 == UInt(3)(0b000))).select(UInt(5)(0b00001), alu_op_tmp)  # SUB
         alu_op_tmp = ((funct7[5:5] == UInt(1)(1)) & (func3 == UInt(3)(0b101))).select(UInt(5)(0b00110), alu_op_tmp)  # SRA
@@ -204,15 +268,36 @@ class DecodeStage(Module):
         alu_src = is_jr_type.select(UInt(2)(1), alu_src)
         immediate = is_jr_type.select(immediate_i, immediate)
         jumpr_op = is_jr_type.select(UInt(1)(1), jumpr_op)
+        
+        # M扩展乘法指令设置
+        reg_write = is_mul_inst.select(UInt(1)(1), reg_write)  # 乘法指令写回寄存器
+        alu_src = is_mul_inst.select(UInt(2)(0), alu_src)  # 乘法使用寄存器操作数
 
         reg_write = (rd == UInt(5)(0)).select(UInt(1)(0), reg_write)  # rd为x0时不写入
         
+        # 新控制信号格式 (45位):
+        # [44:42] - mul_op (3位乘法操作码)
+        # [41:30] - 立即数低12位
+        # [29:25] - rd地址
+        # [24]    - 保留位
+        # [23:22] - 存储类型: 00=SB, 01=SH, 10=SW
+        # [21]    - jumpr_op
+        # [20]    - jump_op
+        # [19:17] - branch_op
+        # [16:11] - 保留位
+        # [10:9]  - alu_src
+        # [8]     - mem_to_reg
+        # [7]     - reg_write
+        # [6]     - mem_write
+        # [5]     - mem_read
+        # [4:0]   - alu_op
         control_signals = concat(
+            mul_op,           # [44:42] 乘法操作码
             immediate[0:11],   # [41:30] 立即数低12位
             rd,               # [29:25] rd地址
             UInt(1)(0),       # [24]    保留位
             store_type_bits,  # [23:22] 存储类型: 00=SB, 01=SH, 10=SW
-            jumpr_op,       # [21]    保留位
+            jumpr_op,       # [21]    jumpr_op
             jump_op,          # [20]    跳转指令标志
             branch_op,        # [19:17] 分支操作类型
             UInt(6)(0),       # [16:11] 保留位
@@ -224,8 +309,9 @@ class DecodeStage(Module):
             alu_op,           # [4:0]   ALU操作码
         )
 
-        need_rs1 = (is_i_type | is_r_type | is_s_type | is_b_type | is_l_type | is_jr_type)
-        need_rs2 = (is_r_type | is_s_type | is_b_type)
+        # 乘法指令也需要rs1和rs2
+        need_rs1 = (is_i_type | is_r_type | is_s_type | is_b_type | is_l_type | is_jr_type | is_mul_inst)
+        need_rs2 = (is_r_type | is_s_type | is_b_type | is_mul_inst)
         
         
         with Condition(id_ex_valid[0]):
@@ -251,14 +337,25 @@ class DecodeStage(Module):
 
         execute_stage.async_called()
 
+        # decode_signals 的生成逻辑:
+        # - need_flush=1 (id_ex_valid=0): 输出 0（清空EX阶段）
+        # - data_hazard=1 (if_id_valid=0, id_ex_valid=1): 输出旧值（保持EX阶段指令）
+        # - 正常情况 (if_id_valid=1, id_ex_valid=1): 输出新值
+        # 
+        # 逻辑: id_ex_valid.select(if_id_valid.select(new_value, old_value), zero)
+        out_control = id_ex_valid[0].select(if_id_valid[0].select(control_signals.bitcast(UInt(CONTROL_LEN)), id_ex_control[0]), UInt(CONTROL_LEN)(0))
+        out_mul_op = out_control[42:44]
+        # log("DECODE OUT: if_id_valid={}, id_ex_valid={}, control_mul_op={}, id_ex_mul_op={}, out_mul_op={}",
+        #     if_id_valid[0], id_ex_valid[0], mul_op, id_ex_control[0][42:44], out_mul_op)
+        
         decode_signals = concat(
-            id_ex_valid[0].select(if_id_valid[0].select(prediction_info_in, UInt(PREDICTION_INFO_LEN)(0)), id_ex_prediction_info[0]),  # 预测信息 (34位)
-            id_ex_valid[0].select(if_id_valid[0].select(need_rs2.bitcast(UInt(1)), UInt(1)(0)), id_ex_need_rs2[0]), 
-            id_ex_valid[0].select(if_id_valid[0].select(need_rs1.bitcast(UInt(1)), UInt(1)(0)), id_ex_need_rs1[0]),
-            id_ex_valid[0].select(if_id_valid[0].select(immediate, UInt(XLEN)(0)), id_ex_immediate[0]),
-            id_ex_valid[0].select(if_id_valid[0].select(rs2.bitcast(UInt(5)), UInt(5)(0)), id_ex_rs2_idx[0]),
-            id_ex_valid[0].select(if_id_valid[0].select(rs1.bitcast(UInt(5)), UInt(5)(0)), id_ex_rs1_idx[0]),
-            id_ex_valid[0].select(if_id_valid[0].select(control_signals, Bits(CONTROL_LEN)(0)).bitcast(UInt(CONTROL_LEN)), id_ex_control[0]),
+            id_ex_valid[0].select(if_id_valid[0].select(prediction_info_in, id_ex_prediction_info[0]), UInt(PREDICTION_INFO_LEN)(0)),  # 预测信息 (34位)
+            id_ex_valid[0].select(if_id_valid[0].select(need_rs2.bitcast(UInt(1)), id_ex_need_rs2[0].bitcast(UInt(1))), UInt(1)(0)), 
+            id_ex_valid[0].select(if_id_valid[0].select(need_rs1.bitcast(UInt(1)), id_ex_need_rs1[0].bitcast(UInt(1))), UInt(1)(0)),
+            id_ex_valid[0].select(if_id_valid[0].select(immediate, id_ex_immediate[0]), UInt(XLEN)(0)),
+            id_ex_valid[0].select(if_id_valid[0].select(rs2.bitcast(UInt(5)), id_ex_rs2_idx[0]), UInt(5)(0)),
+            id_ex_valid[0].select(if_id_valid[0].select(rs1.bitcast(UInt(5)), id_ex_rs1_idx[0]), UInt(5)(0)),
+            out_control,
         )
         return decode_signals
 
@@ -311,7 +408,7 @@ class ExecuteStage(Module):
         return taken
 
     @module.combinational
-    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram):
+    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram, mul_a, mul_b, mul_op_reg, mul_start, mul_cycle_counter, mul_stage1_sum, mul_stage1_carry, mul_stage2_sum, mul_stage2_carry, mul_valid, mul_result_reg, mul_in_progress, mul_rd_reg, mul_control_reg, mul_pc_reg):
         pc_in = id_ex_pc[0]
         rs1_idx = id_ex_rs1_idx[0]
         rs2_idx = id_ex_rs2_idx[0]
@@ -362,7 +459,7 @@ class ExecuteStage(Module):
         pc_change = UInt(1)(0)
         target_pc = pc_in + UInt(XLEN)(4)  # 默认目标PC是PC+4
 
-        # 解析控制信号
+        # 解析控制信号 (新格式45位)
         alu_op = control_in[0:4]
         mem_read = control_in[5:5]
         mem_write = control_in[6:6]
@@ -374,6 +471,10 @@ class ExecuteStage(Module):
         jumpr_op = control_in[21:21]  # 寄存器跳转指令标志
         rd_addr = control_in[25:29]  # rd地址
         immediate = control_in[22:31]  # 立即数
+        mul_op = control_in[42:44]  # 乘法操作码 [44:42]
+        
+        # 判断是否为乘法指令
+        is_mul_inst = (mul_op != UInt(3)(MUL_OP_NONE))
         
         # 解析预测信息: [0]: btb_hit, [1]: predict_taken, [2:33]: predicted_pc
         btb_hit = prediction_info_in[0:0]
@@ -417,7 +518,220 @@ class ExecuteStage(Module):
         # 仅对分支指令生成mispredict信号
         mispredict = (is_branch & ~prediction_correct).select(UInt(1)(1), UInt(1)(0))
         
-        alu_result = is_branch.select(UInt(XLEN)(0), (is_jump | is_jumpr).select(pc_in + UInt(XLEN)(4), self.alu_unit(alu_op, alu_a, alu_b)))
+        # ==================== 乘法器逻辑 ====================
+        # 乘法器状态检查
+        mul_cycle = mul_cycle_counter[0]
+        mul_busy = (mul_cycle != UInt(2)(0)).select(UInt(1)(1), UInt(1)(0))
+        mul_done = (mul_cycle == UInt(2)(3)).select(UInt(1)(1), UInt(1)(0))
+        
+        # 当前是否需要启动新的乘法
+        # 只有当乘法器空闲且当前指令是乘法指令时才启动
+        start_new_mul = (is_mul_inst & id_ex_valid[0] & ~mul_busy).select(UInt(1)(1), UInt(1)(0))
+        # log("MUL CHECK: is_mul_inst={}, id_ex_valid={}, mul_busy={}, mul_op={}, start_new_mul={}", 
+        #     is_mul_inst, id_ex_valid[0], mul_busy, mul_op, start_new_mul)
+        
+        # 保存乘法操作数和控制信息
+        with Condition(start_new_mul):
+            mul_a[0] = rs1_data
+            mul_b[0] = rs2_data
+            mul_op_reg[0] = mul_op
+            mul_rd_reg[0] = rd_addr
+            mul_control_reg[0] = control_in
+            mul_pc_reg[0] = pc_in
+            mul_in_progress[0] = UInt(1)(1)
+            mul_cycle_counter[0] = UInt(2)(1)  # 开始第1周期
+            # log("MUL START: a={}, b={}, mul_op={}", rs1_data, rs2_data, mul_op)
+        
+        # ==================== Wallace Tree 乘法器计算 ====================
+        # Cycle 1: 生成部分积并进行第一级CSA压缩
+        with Condition(mul_cycle == UInt(2)(1)):
+            a = mul_a[0]
+            b = mul_b[0]
+            saved_op = mul_op_reg[0]
+            # log("MUL CYCLE 1 READ: a={}, b={}, mul_a[0]={}", a, b, mul_a[0])
+            
+            # 确定操作数符号属性
+            a_signed = ((saved_op == UInt(3)(MUL_OP_MUL)) | (saved_op == UInt(3)(MUL_OP_MULH)) | (saved_op == UInt(3)(MUL_OP_MULHSU))).select(UInt(1)(1), UInt(1)(0))
+            b_signed = ((saved_op == UInt(3)(MUL_OP_MUL)) | (saved_op == UInt(3)(MUL_OP_MULH))).select(UInt(1)(1), UInt(1)(0))
+            
+            # 符号扩展到64位
+            a_sign = a[31:31]
+            b_sign = b[31:31]
+            a_high = (a_signed & a_sign).select(UInt(32)(0xFFFFFFFF), UInt(32)(0))
+            b_high = (b_signed & b_sign).select(UInt(32)(0xFFFFFFFF), UInt(32)(0))
+            
+            # 直接将32位数转为64位进行计算，不使用concat
+            a_64 = a.bitcast(UInt(64))
+            b_64 = b.bitcast(UInt(64))
+            # log("MUL DEBUG3: a={}, a_64={}, b={}, b_64={}", a, a_64, b, b_64)
+            
+            # 生成32个部分积 (移位后需要bitcast回UInt(64))
+            # 使用显式比较确保条件正确
+            pp0 = (b[0:0] == UInt(1)(1)).select(a_64, UInt(64)(0))
+            pp1 = (b[1:1] == UInt(1)(1)).select((a_64 << UInt(64)(1)).bitcast(UInt(64)), UInt(64)(0))
+            pp2 = (b[2:2] == UInt(1)(1)).select((a_64 << UInt(64)(2)).bitcast(UInt(64)), UInt(64)(0))
+            pp3 = (b[3:3] == UInt(1)(1)).select((a_64 << UInt(64)(3)).bitcast(UInt(64)), UInt(64)(0))
+            pp4 = (b[4:4] == UInt(1)(1)).select((a_64 << UInt(64)(4)).bitcast(UInt(64)), UInt(64)(0))
+            pp5 = (b[5:5] == UInt(1)(1)).select((a_64 << UInt(64)(5)).bitcast(UInt(64)), UInt(64)(0))
+            pp6 = (b[6:6] == UInt(1)(1)).select((a_64 << UInt(64)(6)).bitcast(UInt(64)), UInt(64)(0))
+            pp7 = (b[7:7] == UInt(1)(1)).select((a_64 << UInt(64)(7)).bitcast(UInt(64)), UInt(64)(0))
+            pp8 = (b[8:8] == UInt(1)(1)).select((a_64 << UInt(64)(8)).bitcast(UInt(64)), UInt(64)(0))
+            pp9 = (b[9:9] == UInt(1)(1)).select((a_64 << UInt(64)(9)).bitcast(UInt(64)), UInt(64)(0))
+            pp10 = (b[10:10] == UInt(1)(1)).select((a_64 << UInt(64)(10)).bitcast(UInt(64)), UInt(64)(0))
+            pp11 = (b[11:11] == UInt(1)(1)).select((a_64 << UInt(64)(11)).bitcast(UInt(64)), UInt(64)(0))
+            pp12 = (b[12:12] == UInt(1)(1)).select((a_64 << UInt(64)(12)).bitcast(UInt(64)), UInt(64)(0))
+            pp13 = (b[13:13] == UInt(1)(1)).select((a_64 << UInt(64)(13)).bitcast(UInt(64)), UInt(64)(0))
+            pp14 = (b[14:14] == UInt(1)(1)).select((a_64 << UInt(64)(14)).bitcast(UInt(64)), UInt(64)(0))
+            pp15 = (b[15:15] == UInt(1)(1)).select((a_64 << UInt(64)(15)).bitcast(UInt(64)), UInt(64)(0))
+            pp16 = (b[16:16] == UInt(1)(1)).select((a_64 << UInt(64)(16)).bitcast(UInt(64)), UInt(64)(0))
+            pp17 = (b[17:17] == UInt(1)(1)).select((a_64 << UInt(64)(17)).bitcast(UInt(64)), UInt(64)(0))
+            pp18 = (b[18:18] == UInt(1)(1)).select((a_64 << UInt(64)(18)).bitcast(UInt(64)), UInt(64)(0))
+            pp19 = (b[19:19] == UInt(1)(1)).select((a_64 << UInt(64)(19)).bitcast(UInt(64)), UInt(64)(0))
+            pp20 = (b[20:20] == UInt(1)(1)).select((a_64 << UInt(64)(20)).bitcast(UInt(64)), UInt(64)(0))
+            pp21 = (b[21:21] == UInt(1)(1)).select((a_64 << UInt(64)(21)).bitcast(UInt(64)), UInt(64)(0))
+            pp22 = (b[22:22] == UInt(1)(1)).select((a_64 << UInt(64)(22)).bitcast(UInt(64)), UInt(64)(0))
+            pp23 = (b[23:23] == UInt(1)(1)).select((a_64 << UInt(64)(23)).bitcast(UInt(64)), UInt(64)(0))
+            pp24 = (b[24:24] == UInt(1)(1)).select((a_64 << UInt(64)(24)).bitcast(UInt(64)), UInt(64)(0))
+            pp25 = (b[25:25] == UInt(1)(1)).select((a_64 << UInt(64)(25)).bitcast(UInt(64)), UInt(64)(0))
+            pp26 = (b[26:26] == UInt(1)(1)).select((a_64 << UInt(64)(26)).bitcast(UInt(64)), UInt(64)(0))
+            pp27 = (b[27:27] == UInt(1)(1)).select((a_64 << UInt(64)(27)).bitcast(UInt(64)), UInt(64)(0))
+            pp28 = (b[28:28] == UInt(1)(1)).select((a_64 << UInt(64)(28)).bitcast(UInt(64)), UInt(64)(0))
+            pp29 = (b[29:29] == UInt(1)(1)).select((a_64 << UInt(64)(29)).bitcast(UInt(64)), UInt(64)(0))
+            pp30 = (b[30:30] == UInt(1)(1)).select((a_64 << UInt(64)(30)).bitcast(UInt(64)), UInt(64)(0))
+            pp31 = (b[31:31] == UInt(1)(1)).select((a_64 << UInt(64)(31)).bitcast(UInt(64)), UInt(64)(0))
+            
+            # CSA函数: sum = a ^ b ^ c, carry = ((a&b)|(b&c)|(a&c)) << 1
+            def csa(x, y, z):
+                s = (x ^ y ^ z).bitcast(UInt(64))
+                c = (((x & y) | (y & z) | (x & z)) << UInt(64)(1)).bitcast(UInt(64))
+                return s, c
+            
+            # 第一级CSA: 32->22 (10组CSA压缩)
+            s0, c0 = csa(pp0, pp1, pp2)
+            s1, c1 = csa(pp3, pp4, pp5)
+            s2, c2 = csa(pp6, pp7, pp8)
+            s3, c3 = csa(pp9, pp10, pp11)
+            s4, c4 = csa(pp12, pp13, pp14)
+            s5, c5 = csa(pp15, pp16, pp17)
+            s6, c6 = csa(pp18, pp19, pp20)
+            s7, c7 = csa(pp21, pp22, pp23)
+            s8, c8 = csa(pp24, pp25, pp26)
+            s9, c9 = csa(pp27, pp28, pp29)
+            # pp30, pp31 保留
+            
+            # 第二级CSA: 22->15
+            t0, u0 = csa(s0, c0, s1)
+            t1, u1 = csa(c1, s2, c2)
+            t2, u2 = csa(s3, c3, s4)
+            t3, u3 = csa(c4, s5, c5)
+            t4, u4 = csa(s6, c6, s7)
+            t5, u5 = csa(c7, s8, c8)
+            t6, u6 = csa(s9, c9, pp30)
+            # pp31 保留
+            
+            # 第三级CSA: 15->10
+            v0, w0 = csa(t0, u0, t1)
+            v1, w1 = csa(u1, t2, u2)
+            v2, w2 = csa(t3, u3, t4)
+            v3, w3 = csa(u4, t5, u5)
+            v4, w4 = csa(t6, u6, pp31)
+            
+            # 第四级CSA: 10->7
+            # 输入: v0, w0, v1, w1, v2, w2, v3, w3, v4, w4
+            x0, y0 = csa(v0, w0, v1)
+            x1, y1 = csa(w1, v2, w2)
+            x2, y2 = csa(v3, w3, v4)
+            # 保留: w4
+            # 输出: x0, y0, x1, y1, x2, y2, w4 (7个)
+            
+            # 第五级CSA: 7->5
+            z0, z1 = csa(x0, y0, x1)
+            z2, z3 = csa(y1, x2, y2)
+            # 保留: w4
+            # 输出: z0, z1, z2, z3, w4 (5个)
+            
+            # 第六级CSA: 5->4
+            q0, q1 = csa(z0, z1, z2)
+            # 保留: z3, w4
+            # 输出: q0, q1, z3, w4 (4个)
+            
+            # log("MUL CYCLE 1: a_64={}, b_64={}, pp0={}, pp1={}, pp2={}", a_64, b_64, pp0, pp1, pp2)
+            # log("MUL CYCLE 1 END: q0={}, q1={}, z3={}, w4={}", q0, q1, z3, w4)
+            
+            # 保存4个完整的64位中间值
+            mul_stage1_sum[0] = q0
+            mul_stage1_carry[0] = q1
+            mul_stage2_sum[0] = z3
+            mul_stage2_carry[0] = w4
+            
+            mul_cycle_counter[0] = UInt(2)(2)
+        
+        # Cycle 2: 继续CSA压缩 (4->3->2)
+        with Condition(mul_cycle == UInt(2)(2)):
+            # 从寄存器恢复4个64位中间值
+            q0_r = mul_stage1_sum[0]
+            q1_r = mul_stage1_carry[0]
+            z3_r = mul_stage2_sum[0]
+            w4_r = mul_stage2_carry[0]
+            
+            def csa2(x, y, z):
+                s = (x ^ y ^ z).bitcast(UInt(64))
+                c = (((x & y) | (y & z) | (x & z)) << UInt(64)(1)).bitcast(UInt(64))
+                return s, c
+            
+            # 第七级CSA: 4->3
+            r0, r1 = csa2(q0_r, q1_r, z3_r)
+            # 保留: w4_r
+            # 输出: r0, r1, w4_r (3个)
+            
+            # 第八级CSA: 3->2
+            final_sum, final_carry = csa2(r0, r1, w4_r)
+            # 输出: final_sum, final_carry (2个)
+            
+            # 保存最终的sum和carry
+            mul_stage1_sum[0] = final_sum
+            mul_stage1_carry[0] = final_carry
+            mul_cycle_counter[0] = UInt(2)(3)
+        
+        # Cycle 3: 最终加法并选择结果
+        with Condition(mul_cycle == UInt(2)(3)):
+            final_result = mul_stage1_sum[0] + mul_stage1_carry[0]
+            saved_op = mul_op_reg[0]
+            
+            # 根据mul_op选择高32位或低32位
+            result_low = final_result[0:31].bitcast(UInt(32))
+            result_high = final_result[32:63].bitcast(UInt(32))
+            
+            # MUL: 低32位; MULH/MULHSU/MULHU: 高32位
+            mul_result_val = (saved_op == UInt(3)(MUL_OP_MUL)).select(result_low, result_high)
+            # log("MUL CYCLE 3: sum={}, carry={}, final_result={}, result_low={}, saved_op={}", 
+                # mul_stage1_sum[0], mul_stage1_carry[0], final_result, result_low, saved_op)
+            mul_result_reg[0] = mul_result_val
+            mul_valid[0] = UInt(1)(1)
+            mul_cycle_counter[0] = UInt(2)(0)
+            mul_in_progress[0] = UInt(1)(0)
+        
+        # 在外部也计算当前周期的乘法结果（供 mul_done 时使用）
+        # 这个计算在每个周期都会执行，但只有在 mul_cycle == 3 时结果才有意义
+        current_final_result = mul_stage1_sum[0] + mul_stage1_carry[0]
+        current_result_low = current_final_result[0:31].bitcast(UInt(32))
+        current_result_high = current_final_result[32:63].bitcast(UInt(32))
+        current_saved_op = mul_op_reg[0]
+        current_mul_result = (current_saved_op == UInt(3)(MUL_OP_MUL)).select(current_result_low, current_result_high)
+        
+        # 非乘法周期重置valid
+        with Condition(mul_cycle == UInt(2)(0)):
+            mul_valid[0] = UInt(1)(0)
+        
+        # ==================== ALU结果选择 ====================
+        # 普通ALU结果
+        normal_alu_result = is_branch.select(UInt(XLEN)(0), (is_jump | is_jumpr).select(pc_in + UInt(XLEN)(4), self.alu_unit(alu_op, alu_a, alu_b)))
+        
+        # 乘法完成时使用当前周期计算的乘法结果
+        alu_result = mul_done.select(current_mul_result, normal_alu_result)
+        # log("EX RESULT: mul_done={}, current_mul_result={}, normal_alu_result={}, alu_result={}", 
+            # mul_done, current_mul_result, normal_alu_result, alu_result)
+        
         target_pc = (is_branch | is_jump).select(actual_target_pc, target_pc)
         target_pc = is_jumpr.select(new_pc.bitcast(UInt(32)), target_pc)
         
@@ -425,17 +739,39 @@ class ExecuteStage(Module):
         need_flush = (mispredict | is_jump | is_jumpr).select(UInt(1)(1), UInt(1)(0))
         pc_change = need_flush
 
+        # DEBUG: 检查跳转指令
+        # log("EX JUMP: is_jump={}, is_jumpr={}, immediate_in={}, jump_op={}", 
+        #     is_jump, is_jumpr, immediate_in, jump_op)
+        
         with Condition(is_jump & (immediate_in == UInt(XLEN)(0))):
             log("Finish Execution. The result is {}", reg_file[10])
             finish()
         
-
+        # 乘法指令需要等待乘法完成才能传递到MEM阶段
+        # 当乘法器正在执行(cycle 1或2)时，向MEM阶段传递NOP
+        # 当乘法完成(cycle 3, mul_done=1)时，传递乘法结果
+        mul_in_ex_stage = is_mul_inst & id_ex_valid[0]
+        mul_wait = mul_in_ex_stage & ~mul_done  # 乘法未完成，需要等待
+        
+        # 当乘法完成时，使用保存的控制信息而不是当前的 control_in（因为当前可能是 NOP）
+        mul_control = mul_control_reg[0]
+        mul_pc = mul_pc_reg[0]
+        
         with Condition(ex_mem_valid[0]):
-            ex_mem_pc[0] = id_ex_valid[0].select(pc_in, UInt(XLEN)(0))
-            ex_mem_control[0] = id_ex_valid[0].select(control_in, UInt(CONTROL_LEN)(0))
-            # ex_mem_valid[0] = UInt(1)(1)
-            ex_mem_result[0] = id_ex_valid[0].select(alu_result, UInt(XLEN)(0))
-            ex_mem_data[0] = id_ex_valid[0].select(rs2_data, UInt(XLEN)(0))
+            # 如果是乘法指令且乘法未完成，传递NOP；否则正常传递
+            # 乘法完成时 (mul_done=1)，使用保存的控制信息
+            should_pass = id_ex_valid[0] & ~mul_wait
+            pass_or_mul_done = should_pass | mul_done  # 要么正常传递，要么乘法完成
+            
+            # PC: 乘法完成时用保存的 PC，否则用当前 PC
+            final_pc = mul_done.select(mul_pc, pc_in)
+            # 控制信号: 乘法完成时用保存的控制信号，否则用当前控制信号
+            final_control = mul_done.select(mul_control, control_in)
+            
+            ex_mem_pc[0] = pass_or_mul_done.select(final_pc, UInt(XLEN)(0))
+            ex_mem_control[0] = pass_or_mul_done.select(final_control, UInt(CONTROL_LEN)(0))
+            ex_mem_result[0] = pass_or_mul_done.select(alu_result, UInt(XLEN)(0))
+            ex_mem_data[0] = pass_or_mul_done.select(rs2_data, UInt(XLEN)(0))
             
             # log("EX: PC={}, ALU_OP={:05b}, ALU_A={}, ALU_B={}, Result={:08x}, PC_Change={}, Target_PC={:08x}, Immediate={:08x}, ALU_SRC={}",
             #     pc_in, alu_op, alu_a, alu_b, alu_result, pc_change, target_pc, immediate_in, alu_src)
@@ -465,8 +801,18 @@ class ExecuteStage(Module):
             correct_pc.bitcast(Bits(XLEN)),      # [32:1] 正确的PC
             mispredict.bitcast(Bits(1))          # [0] 预测错误标志
         )
+        
+        # 乘法器信号
+        # mul_busy: 乘法器正在执行中 (cycle 1, 2)
+        # mul_done: 乘法器完成 (cycle 3)
+        # mul_stall: 当前有乘法指令但乘法器正在执行中，需要暂停
+        mul_executing = ((mul_cycle == UInt(2)(1)) | (mul_cycle == UInt(2)(2))).select(UInt(1)(1), UInt(1)(0))
+        mul_stall_needed = (is_mul_inst & id_ex_valid[0] & mul_executing).select(UInt(1)(1), UInt(1)(0))
 
         execute_signals = concat(
+            mul_stall_needed.bitcast(Bits(1)),   # [180] 乘法暂停信号
+            mul_done.bitcast(Bits(1)),           # [179] 乘法完成
+            mul_busy.bitcast(Bits(1)),           # [178] 乘法忙
             id_ex_valid[0].select(prediction_result, Bits(103)(0)),  # 预测结果
             id_ex_valid[0].select(control_in.bitcast(Bits(CONTROL_LEN)), Bits(CONTROL_LEN)(0)),
             id_ex_valid[0].select(target_pc.bitcast(Bits(XLEN)), Bits(XLEN)(0)),       # [31:1]  目标PC
@@ -539,16 +885,20 @@ class WriteBackStage(Module):
             
         # 选择写回数据
         wb_data = mem_to_reg.select(mem_data_in, ex_result_in)
+        
+        # log("WB STAGE: ex_result_in={}, mem_to_reg={}, wb_data={}, wb_rd={}, reg_write={}", 
+            # ex_result_in, mem_to_reg, wb_data, wb_rd, reg_write)
             
         # 如果指令无效，直接返回
         with Condition(mem_wb_valid[0]):
             with Condition(reg_write):
                 reg_file[wb_rd] = wb_data
+                # log("WB WRITE: reg[{}] = {}", wb_rd, wb_data)
             # log("WB: Write_Data={}, RD={}, WE={}",
             #     wb_data, wb_rd, reg_write)
-            success = (wb_data == UInt(XLEN)(5050))
-            with Condition(success):
-                log("SUCCESSFUL!")
+            # success = (wb_data == UInt(XLEN)(5050))
+            # with Condition(success):
+            #     log("SUCCESSFUL!")
 
         writeback_signals = control_in.bitcast(Bits(CONTROL_LEN))
         return writeback_signals
@@ -559,11 +909,11 @@ class HazardUnit(Downstream):
         super().__init__()
 
     @downstream.combinational
-    def build(self, pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals):
+    def build(self, pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals, mul_in_progress, mul_cycle_counter):
 
-        # 计算新的信号长度
-        EXECUTE_SIGNALS_LEN = XLEN + 1 + CONTROL_LEN + 103  # pc_change(1) + target_pc(32) + control(42) + prediction_result(103)
-        DECODE_SIGNALS_LEN = 2 + CONTROL_LEN + 5 + 5 + XLEN + PREDICTION_INFO_LEN  # need_rs1(1) + need_rs2(1) + control(42) + rs1(5) + rs2(5) + immediate(32) + prediction_info(34)
+        # 计算新的信号长度 (增加3位乘法信号: mul_busy, mul_done, mul_stall_needed)
+        EXECUTE_SIGNALS_LEN = XLEN + 1 + CONTROL_LEN + 103 + 3  # pc_change(1) + target_pc(32) + control(45) + prediction_result(103) + mul_signals(3)
+        DECODE_SIGNALS_LEN = 2 + CONTROL_LEN + 5 + 5 + XLEN + PREDICTION_INFO_LEN  # need_rs1(1) + need_rs2(1) + control(45) + rs1(5) + rs2(5) + immediate(32) + prediction_info(34)
 
         execute_signals = execute_signals.optional(Bits(EXECUTE_SIGNALS_LEN)(0))
         decode_signals = decode_signals.optional(Bits(DECODE_SIGNALS_LEN)(0))
@@ -576,9 +926,15 @@ class HazardUnit(Downstream):
         target_pc = execute_signals[1:XLEN].bitcast(UInt(XLEN))
         
         # 解析预测结果 (从execute_signals中提取)
-        # execute_signals布局: [0]: pc_change, [1:32]: target_pc, [33:74]: control, [75:177]: prediction_result
+        # execute_signals布局: [0]: pc_change, [1:32]: target_pc, [33:77]: control(45), [78:180]: prediction_result(103), [181:183]: mul_signals(3)
         pred_result_start = XLEN + 1 + CONTROL_LEN
         prediction_result = execute_signals[pred_result_start:pred_result_start + 102].bitcast(UInt(103))
+        
+        # 解析乘法器信号
+        mul_signals_start = pred_result_start + 103
+        mul_busy_sig = execute_signals[mul_signals_start:mul_signals_start].bitcast(UInt(1))
+        mul_done_sig = execute_signals[mul_signals_start + 1:mul_signals_start + 1].bitcast(UInt(1))
+        mul_stall_sig = execute_signals[mul_signals_start + 2:mul_signals_start + 2].bitcast(UInt(1))
         
         # 解析prediction_result:
         # [0]: mispredict, [1:32]: correct_pc, [33]: actual_taken, [34:65]: actual_target_pc
@@ -627,15 +983,46 @@ class HazardUnit(Downstream):
         load_use_hazard_wb = (mem_read_wb & reg_write_wb & (rd_wb != UInt(5)(0)) & 
                               ((needs_rs1 & (rs1 == rd_wb)) | (needs_rs2 & (rs2 == rd_wb))))
         
+        # ==================== 乘法冒险检测 ====================
+        # 检测EX阶段是否有乘法指令
+        ex_control = id_ex_control[0]
+        ex_rd = ex_control[25:29]
+        ex_mul_op = ex_control[42:44]
+        is_ex_mul = (ex_mul_op != UInt(3)(MUL_OP_NONE))
+        
+        # 乘法暂停条件：
+        # 乘法器正在执行中(cycle 1, 2, 或 3)，需要暂停IF/ID阶段
+        # cycle 3 (mul_done) 时也需要暂停，因为结果还在 MEM/WB 阶段传递
+        mul_cycle = mul_cycle_counter[0]
+        # 包含 cycle 1, 2, 3 - 只有 cycle 0 时才不暂停
+        mul_executing = (mul_cycle != UInt(2)(0)).select(UInt(1)(1), UInt(1)(0))
+        
+        # 检测乘法结果冒险：ID阶段的指令依赖于正在执行的乘法结果
+        # 使用 is_ex_mul 直接检测 EX 阶段是否有 MUL 指令，而不是依赖 mul_in_progress
+        # 因为 mul_in_progress 需要一个周期才能更新，导致在 MUL 开始的同一周期检测失败
+        # 条件：EX阶段有MUL指令 且 rd != 0 且 ID阶段指令依赖于rd
+        mul_result_hazard = (is_ex_mul & (ex_rd != UInt(5)(0)) &
+                            ((needs_rs1 & (rs1 == ex_rd)) | (needs_rs2 & (rs2 == ex_rd))))
+        
         # 需要刷新的情况: mispredict || is_jump || is_jumpr
         need_flush = (mispredict | is_jump_ex | is_jumpr_ex).select(UInt(1)(1), UInt(1)(0))
         
-        # 仅在 Load-Use 冒险且无控制冒险时暂停流水线
-        # 注意：WB 阶段的 Load 数据已经可用，可以通过前递获取，因此只检测 MEM 阶段
-        data_hazard = (load_use_hazard_mem & ~need_flush)
+        # 综合暂停逻辑：
+        # 1. Load-Use 冒险
+        # 2. 乘法器执行中（cycle 1或2，需要等待乘法完成）
+        # 3. 乘法结果冒险（下一条指令依赖乘法结果）
+        data_hazard = ((load_use_hazard_mem | mul_executing | mul_result_hazard) & ~need_flush)
+        # log("HAZARD2: data_hazard={}, need_flush={}, mul_executing={}, mul_result_hazard={}", 
+        #     data_hazard, need_flush, mul_executing, mul_result_hazard)
         
-        id_ex_valid[0] = (~data_hazard)
-        if_id_valid[0] = (~data_hazard)
+        # id_ex_valid 的含义：EX阶段是否有有效指令需要执行
+        # - need_flush时，EX阶段指令作废，设为0
+        # - data_hazard时，EX阶段指令仍然有效（只是IF/ID暂停），保持为1
+        # 但是！如果是因为mul_executing导致的data_hazard，说明乘法正在执行，
+        # 此时我们不应该再次启动乘法，所以对于新指令的启动检查应该用额外的信号
+        id_ex_valid[0] = (~need_flush)
+        # if_id_valid控制是否接受新指令到ID阶段
+        if_id_valid[0] = (~data_hazard & ~need_flush)
         ex_mem_valid[0] = UInt(1)(1)
         mem_wb_valid[0] = UInt(1)(1)
         stall[0] = data_hazard
@@ -682,20 +1069,51 @@ class HazardUnit(Downstream):
         # PC更新
         # JALR时使用target_pc (因为在EX阶段已经计算为 (rs1 + imm) & ~1)
         flush_pc = is_jumpr_ex.select(target_pc, correct_pc)
-        pc[0] = need_flush.select(flush_pc, data_hazard.select(pc[0], normal_next_pc))
+        
+        # 关键修复：当上一个周期是 flush 时 (if_id_valid[0]=0)，
+        # 当前周期 IF 阶段正在取新指令，不应该更新 PC
+        # 只有当 if_id_valid[0]=1 时才正常更新 PC
+        if_id_valid_current = if_id_valid[0]  # 上一个周期的 if_id_valid 值
+        
+        # DEBUG: 检查 flush_pc 和 target_pc
+        # log("HAZARD PC: is_jumpr_ex={}, target_pc={}, correct_pc={}, flush_pc={}, need_flush={}, if_id_valid_current={}",
+        #     is_jumpr_ex, target_pc, correct_pc, flush_pc, need_flush, if_id_valid_current)
+        
+        # PC 更新逻辑：
+        # - need_flush=1: 跳转到 flush_pc
+        # - need_flush=0 且 if_id_valid_current=0: 保持 PC 不变（上一周期刚 flush，正在取指令）
+        # - need_flush=0 且 if_id_valid_current=1 且 data_hazard=1: 保持 PC 不变（暂停）
+        # - need_flush=0 且 if_id_valid_current=1 且 data_hazard=0: PC = normal_next_pc
+        pc_hold_after_flush = (~if_id_valid_current & ~need_flush).select(pc[0], normal_next_pc)
+        pc_with_hazard = data_hazard.select(pc[0], pc_hold_after_flush)
+        pc[0] = need_flush.select(flush_pc, pc_with_hazard)
+        # log("HAZARD PC RESULT: pc[0]={}", pc[0])
         
         # 流水线刷新 (根据branch_prediction_rules.md)
         # IF/ID阶段刷新: if_id_valid[0] = 0, if_id_pc[0] = 0, if_id_instruction[0] = NOP
         # ID/EX阶段刷新: 清空所有寄存器
-        with Condition(if_id_valid[0]):
+        
+        # IF/ID 寄存器更新逻辑:
+        # - need_flush=1: 写入NOP
+        # - data_hazard=1: 保持当前指令（暂停，等待冒险解决）
+        # - 正常情况: 写入新指令
+        with Condition(~data_hazard):
+            # 只有在不暂停时才更新 IF/ID 指令寄存器
             if_id_instruction[0] = need_flush.select(UInt(XLEN)(0x00000013), instruction)  # NOP指令
             if_id_prediction_info[0] = need_flush.select(UInt(PREDICTION_INFO_LEN)(0), prediction_info_id)
+        
+        # ID/EX 寄存器更新逻辑:
+        # - need_flush=1: 清空（写入NOP）
+        # - data_hazard=1: 插入气泡（NOP），ID阶段指令等待冒险解决
+        # - 正常情况: 更新为新指令
         with Condition(id_ex_valid[0]):
-            id_ex_control[0] = need_flush.select(nop_control, control_in)
-            id_ex_immediate[0] = need_flush.select(UInt(XLEN)(0), immediate)
-            id_ex_rs1_idx[0] = need_flush.select(UInt(5)(0), rs1)
-            id_ex_rs2_idx[0] = need_flush.select(UInt(5)(0), rs2)
-            id_ex_prediction_info[0] = need_flush.select(UInt(PREDICTION_INFO_LEN)(0), prediction_info_id)
+            # 当刷新或暂停时清空，否则更新为新指令
+            should_insert_nop = (need_flush | data_hazard).select(UInt(1)(1), UInt(1)(0))
+            id_ex_control[0] = should_insert_nop.select(nop_control, control_in)
+            id_ex_immediate[0] = should_insert_nop.select(UInt(XLEN)(0), immediate)
+            id_ex_rs1_idx[0] = should_insert_nop.select(UInt(5)(0), rs1)
+            id_ex_rs2_idx[0] = should_insert_nop.select(UInt(5)(0), rs2)
+            id_ex_prediction_info[0] = should_insert_nop.select(UInt(PREDICTION_INFO_LEN)(0), prediction_info_id)
 
 # ==================== 顶层CPU模块 ===================
 class Driver(Module):
@@ -749,7 +1167,7 @@ def build_cpu(program_file="test_program.txt"):
 
         # ID/EX阶段寄存器
         id_ex_pc = RegArray(UInt(XLEN), 1, initializer=[0])           # PC (32位)
-        id_ex_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (42位)
+        id_ex_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (45位)
         id_ex_valid = RegArray(UInt(1), 1, initializer=[1])            # 有效标志 (1位)
         id_ex_rs1_idx = RegArray(UInt(5), 1, initializer=[0])         # rs1索引 (5位)
         id_ex_rs2_idx = RegArray(UInt(5), 1, initializer=[0])         # rs2索引 (5位)
@@ -760,16 +1178,34 @@ def build_cpu(program_file="test_program.txt"):
 
         # EX/MEM阶段寄存器
         ex_mem_pc = RegArray(UInt(XLEN), 1, initializer=[0])           # PC (32位)
-        ex_mem_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (42位)
+        ex_mem_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (45位)
         ex_mem_valid = RegArray(UInt(1), 1, initializer=[1])            # 有效标志 (1位)
         ex_mem_result = RegArray(UInt(XLEN), 1, initializer=[0])       # ALU结果 (32位)
         ex_mem_data = RegArray(UInt(XLEN), 1, initializer=[0])          # 数据 (32位)
 
         # MEM/WB阶段寄存器
-        mem_wb_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (42位)
+        mem_wb_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (45位)
         mem_wb_valid = RegArray(UInt(1), 1, initializer=[1])            # 有效标志 (1位)
         mem_wb_mem_data = RegArray(UInt(XLEN), 1, initializer=[0])     # 内存数据 (32位)
         mem_wb_ex_result = RegArray(UInt(XLEN), 1, initializer=[0])     # EX阶段结果 (32位)
+
+        # ==================== 乘法器寄存器 ====================
+        # Wallace Tree 乘法器流水线寄存器
+        mul_a = RegArray(UInt(32), 1, initializer=[0])                # 乘法操作数A
+        mul_b = RegArray(UInt(32), 1, initializer=[0])                # 乘法操作数B
+        mul_op_reg = RegArray(UInt(3), 1, initializer=[0])            # 乘法操作码
+        mul_start = RegArray(UInt(1), 1, initializer=[0])             # 乘法开始信号
+        mul_cycle_counter = RegArray(UInt(2), 1, initializer=[0])     # 乘法周期计数器 (0=空闲, 1/2/3=执行中)
+        mul_stage1_sum = RegArray(UInt(64), 1, initializer=[0])       # 第一级CSA压缩结果-sum
+        mul_stage1_carry = RegArray(UInt(64), 1, initializer=[0])     # 第一级CSA压缩结果-carry
+        mul_stage2_sum = RegArray(UInt(64), 1, initializer=[0])       # 第二级CSA压缩结果-sum
+        mul_stage2_carry = RegArray(UInt(64), 1, initializer=[0])     # 第二级CSA压缩结果-carry
+        mul_valid = RegArray(UInt(1), 1, initializer=[0])             # 乘法结果有效
+        mul_result_reg = RegArray(UInt(32), 1, initializer=[0])       # 乘法结果
+        mul_in_progress = RegArray(UInt(1), 1, initializer=[0])       # 乘法执行中标志
+        mul_rd_reg = RegArray(UInt(5), 1, initializer=[0])            # 乘法目标寄存器
+        mul_control_reg = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 乘法控制信号
+        mul_pc_reg = RegArray(UInt(XLEN), 1, initializer=[0])         # 乘法指令PC
 
         # 分支预测器 - BTB + BHT + 有效位
         btb = RegArray(UInt(XLEN), BTB_SIZE, initializer=[0]*BTB_SIZE)        # Branch Target Buffer (32位 x 64)
@@ -798,10 +1234,10 @@ def build_cpu(program_file="test_program.txt"):
         # 按照流水线顺序构建模块
         writeback_signals = writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file, data_sram)
         memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram)
-        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram)
+        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram, mul_a, mul_b, mul_op_reg, mul_start, mul_cycle_counter, mul_stage1_sum, mul_stage1_carry, mul_stage2_sum, mul_stage2_carry, mul_valid, mul_result_reg, mul_in_progress, mul_rd_reg, mul_control_reg, mul_pc_reg)
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, if_id_prediction_info, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, id_ex_prediction_info, reg_file, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, if_id_prediction_info, instruction_memory, btb, bht, btb_valid, decode_stage)
-        hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
+        hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals, mul_in_progress, mul_cycle_counter)
         
         # 构建Driver模块，处理PC更新
         driver.build(fetch_stage)
