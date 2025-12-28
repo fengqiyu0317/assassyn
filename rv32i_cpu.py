@@ -311,7 +311,7 @@ class ExecuteStage(Module):
         return taken
 
     @module.combinational
-    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage):
+    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram):
         pc_in = id_ex_pc[0]
         rs1_idx = id_ex_rs1_idx[0]
         rs2_idx = id_ex_rs2_idx[0]
@@ -319,9 +319,44 @@ class ExecuteStage(Module):
         control_in = id_ex_control[0]
         prediction_info_in = id_ex_prediction_info[0]
 
-        # 直接从寄存器文件读取rs1和rs2的值
-        rs1_data = reg_file[rs1_idx]
-        rs2_data = reg_file[rs2_idx]
+        # ==================== Bypass/Forwarding 逻辑 ====================
+        # 从寄存器文件读取基础值
+        rs1_reg = reg_file[rs1_idx]
+        rs2_reg = reg_file[rs2_idx]
+        
+        # 解析 MEM 阶段控制信号（来自 EX/MEM 寄存器）用于前递
+        mem_control = ex_mem_control[0]
+        mem_reg_write = mem_control[7:7]  # reg_write 在第7位
+        mem_rd = mem_control[25:29]       # rd 在第25-29位
+        mem_result = ex_mem_result[0]     # MEM 阶段的 ALU 结果
+        
+        # 解析 WB 阶段控制信号用于前递
+        wb_control = mem_wb_control[0]
+        wb_reg_write = wb_control[7:7]    # reg_write 在第7位
+        wb_mem_to_reg = wb_control[8:8]   # mem_to_reg 在第8位
+        wb_rd = wb_control[25:29]         # rd 在第25-29位
+        wb_ex_result = mem_wb_ex_result[0]
+        wb_mem_data = data_sram.dout[0]   # 从 SRAM 读取的数据
+        
+        # WB 阶段数据选择：若 mem_to_reg=1 使用内存数据，否则使用 ALU 结果
+        wb_data = wb_mem_to_reg.select(wb_mem_data, wb_ex_result)
+        
+        # rs1 前递逻辑：优先级 MEM > WB > reg_file
+        # 条件：reg_write=1 且 rs1_idx=rd 且 rd!=0（x0不能前递）
+        rs1_forward_mem = (ex_mem_valid[0] & mem_reg_write & (rs1_idx == mem_rd) & (mem_rd != UInt(5)(0)))
+        rs1_forward_wb = (mem_wb_valid[0] & wb_reg_write & (rs1_idx == wb_rd) & (wb_rd != UInt(5)(0)))
+        
+        rs1_data = rs1_reg
+        rs1_data = rs1_forward_wb.select(wb_data, rs1_data)
+        rs1_data = rs1_forward_mem.select(mem_result, rs1_data)
+        
+        # rs2 前递逻辑：优先级 MEM > WB > reg_file
+        rs2_forward_mem = (ex_mem_valid[0] & mem_reg_write & (rs2_idx == mem_rd) & (mem_rd != UInt(5)(0)))
+        rs2_forward_wb = (mem_wb_valid[0] & wb_reg_write & (rs2_idx == wb_rd) & (wb_rd != UInt(5)(0)))
+        
+        rs2_data = rs2_reg
+        rs2_data = rs2_forward_wb.select(wb_data, rs2_data)
+        rs2_data = rs2_forward_mem.select(mem_result, rs2_data)
         
         # 初始化PC变化控制信号
         pc_change = UInt(1)(0)
@@ -574,25 +609,30 @@ class HazardUnit(Downstream):
         memory_control = id_ex_valid[0].select(memory_control, UInt(CONTROL_LEN)(0))
         rd_mem = memory_control[25:29]
         reg_write_mem = memory_control[7:7]
+        mem_read_mem = memory_control[5:5]  # 解析 mem_read 信号用于检测 Load-Use 冒险
         
         wb_control = memory_signals.bitcast(UInt(CONTROL_LEN))
         wb_control = ex_mem_valid[0].select(wb_control, UInt(CONTROL_LEN)(0))
         rd_wb = wb_control[25:29]
         reg_write_wb = wb_control[7:7]
+        mem_read_wb = wb_control[5:5]  # WB 阶段的 mem_read 信号
         
-        # 初始化数据冒险信号
-        data_hazard_ex = UInt(1)(0)  # 与EX阶段指令的数据冒险
-        data_hazard_wb = UInt(1)(0)   # 与WB阶段指令的数据冒险
+        # ==================== Load-Use 冒险检测 ====================
+        # 只有 Load-Use 冒险需要暂停，其他数据冒险通过 bypass/forwarding 解决
+        # Load-Use 冒险：MEM 阶段为 Load 指令（mem_read=1）且目标寄存器与 ID 阶段源寄存器相同
+        load_use_hazard_mem = (mem_read_mem & reg_write_mem & (rd_mem != UInt(5)(0)) & 
+                               ((needs_rs1 & (rs1 == rd_mem)) | (needs_rs2 & (rs2 == rd_mem))))
         
-        data_hazard_ex = (reg_write_mem & ((needs_rs1 & (rs1 == rd_mem)) | (needs_rs2 & (rs2 == rd_mem)))).select(UInt(1)(1), data_hazard_ex)
-        data_hazard_wb = (reg_write_wb & ((needs_rs1 & (rs1 == rd_wb)) | (needs_rs2 & (rs2 == rd_wb)))).select(UInt(1)(1), data_hazard_wb)
+        # WB 阶段 Load-Use 冒险（理论上通过前递可以解决，但作为安全检测保留）
+        load_use_hazard_wb = (mem_read_wb & reg_write_wb & (rd_wb != UInt(5)(0)) & 
+                              ((needs_rs1 & (rs1 == rd_wb)) | (needs_rs2 & (rs2 == rd_wb))))
         
         # 需要刷新的情况: mispredict || is_jump || is_jumpr
         need_flush = (mispredict | is_jump_ex | is_jumpr_ex).select(UInt(1)(1), UInt(1)(0))
         
-        # 根据规则: 预测错误优先级高于数据冒险
-        # stall[0] = data_hazard && !mispredict && !is_jump && !is_jumpr
-        data_hazard = ((data_hazard_ex | data_hazard_wb) & ~need_flush)
+        # 仅在 Load-Use 冒险且无控制冒险时暂停流水线
+        # 注意：WB 阶段的 Load 数据已经可用，可以通过前递获取，因此只检测 MEM 阶段
+        data_hazard = (load_use_hazard_mem & ~need_flush)
         
         id_ex_valid[0] = (~data_hazard)
         if_id_valid[0] = (~data_hazard)
@@ -758,7 +798,7 @@ def build_cpu(program_file="test_program.txt"):
         # 按照流水线顺序构建模块
         writeback_signals = writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file, data_sram)
         memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram)
-        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage)
+        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram)
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, if_id_prediction_info, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, id_ex_prediction_info, reg_file, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, if_id_prediction_info, instruction_memory, btb, bht, btb_valid, decode_stage)
         hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
