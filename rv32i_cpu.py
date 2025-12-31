@@ -740,8 +740,15 @@ class ExecuteStage(Module):
         pc_change = need_flush
 
         # DEBUG: 检查跳转指令
-        # log("EX JUMP: is_jump={}, is_jumpr={}, immediate_in={}, jump_op={}", 
-        #     is_jump, is_jumpr, immediate_in, jump_op)
+        # with Condition(is_jumpr):
+        #     log("EX JALR: PC={:08x}, rs1_data={:08x}, imm={:08x}, target={:08x}, rs1_idx={}", 
+        #         pc_in, rs1_data, immediate_in, new_pc, rs1_idx)
+        # with Condition(is_jump):
+        #     log("EX JAL: PC={:08x}, imm={:08x}, target={:08x}, rd={}", 
+        #         pc_in, immediate_in, actual_target_pc, rd_addr)
+        # with Condition(is_branch):
+        #     log("EX BRANCH: PC={:08x}, taken={}, target={:08x}, rs1={:08x}, rs2={:08x}", 
+        #         pc_in, actual_taken, actual_target_pc, rs1_data, rs2_data)
         
         with Condition(is_jump & (immediate_in == UInt(XLEN)(0))):
             log("Finish Execution. The result is {}", reg_file[10])
@@ -1068,7 +1075,9 @@ class HazardUnit(Downstream):
         
         # PC更新
         # JALR时使用target_pc (因为在EX阶段已经计算为 (rs1 + imm) & ~1)
-        flush_pc = is_jumpr_ex.select(target_pc, correct_pc)
+        # JAL时使用actual_target_pc (pc + immediate)
+        # 分支误预测时使用correct_pc
+        flush_pc = is_jumpr_ex.select(target_pc, is_jump_ex.select(actual_target_pc, correct_pc))
         
         # 关键修复：当上一个周期是 flush 时 (if_id_valid[0]=0)，
         # 当前周期 IF 阶段正在取新指令，不应该更新 PC

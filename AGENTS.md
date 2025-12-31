@@ -885,13 +885,6 @@ apptainer exec ./assassyn.sif python ./array_increment.py
 apptainer exec ./assassyn.sif python ./rv32i_cpu.py
 ```
 
-### 生成测试数据
-
-使用 [`gen_hex.py`](gen_hex.py:1) 生成 `data.hex` 文件：
-```bash
-apptainer exec ./assassyn.sif python ./gen_hex.py
-```
-
 ### 运行基准测试
 
 基准测试程序位于 `benchmarks/` 目录下。每个基准测试目录包含：
@@ -899,12 +892,13 @@ apptainer exec ./assassyn.sif python ./gen_hex.py
 - 十六进制机器码（`test.hex`）
 - 程序文本格式（`program.txt`）
 
-运行基准测试前，需要将对应的 `program.txt` 复制为 `test_program.txt`：
 ```bash
-# 示例：运行 add_while 基准测试
-cp benchmarks/add_while/program.txt test_program.txt
 apptainer exec ./assassyn.sif python ./rv32i_cpu.py
 ```
+
+**你总可以假设测试数据已被正确拷贝到 test_program.txt 以及 data.hex 中**
+
+**程序所有日志的输出在 reslut.out 中，直接输出的为运行是否正确的信息**
 
 ### 调试技巧
 
