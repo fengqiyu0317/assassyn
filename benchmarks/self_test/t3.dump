@@ -1,0 +1,23 @@
+
+t3.elf:     file format elf32-littleriscv
+
+
+Disassembly of section .text:
+
+00000000 <_start>:
+   0:	00004137          	lui	sp,0x4
+   4:	00000097          	auipc	ra,0x0
+   8:	00c080e7          	jalr	12(ra) # 10 <main>
+
+0000000c <loop>:
+   c:	0000006f          	j	c <loop>
+
+00000010 <main>:
+  10:	ff010113          	addi	sp,sp,-16 # 3ff0 <main+0x3fe0>
+  14:	00812623          	sw	s0,12(sp)
+  18:	01010413          	addi	s0,sp,16
+  1c:	00a00793          	li	a5,10
+  20:	00078513          	mv	a0,a5
+  24:	00c12403          	lw	s0,12(sp)
+  28:	01010113          	addi	sp,sp,16
+  2c:	00008067          	ret

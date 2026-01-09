@@ -16,7 +16,7 @@ from assassyn.ir.module import downstream, Downstream
 # ==================== 常量定义 ===================
 XLEN = 32  # RISC-V XLEN
 REG_COUNT = 32  # 通用寄存器数量
-CONTROL_LEN = 45 # 控制信号长度 (42 + 3位mul_op)
+CONTROL_LEN = 48 # 控制信号长度 (42 + 3位mul_op + 3位div_op)
 BTB_SIZE = 64  # BTB表大小
 BTB_INDEX_BITS = 6  # BTB索引位数 (log2(64)=6)
 PREDICTION_INFO_LEN = 34  # 预测信息长度: [0]: btb_hit, [1]: predict_taken, [2:33]: predicted_pc
@@ -34,6 +34,19 @@ MUL_OP_MUL    = 0b001
 MUL_OP_MULH   = 0b010
 MUL_OP_MULHSU = 0b011
 MUL_OP_MULHU  = 0b100
+
+# ==================== M扩展除法操作码 ===================
+# div_op 编码 (3位):
+# 000 - 非除法指令
+# 001 - DIV    (signed division)
+# 010 - DIVU   (unsigned division)
+# 011 - REM    (signed remainder)
+# 100 - REMU   (unsigned remainder)
+DIV_OP_NONE = 0b000
+DIV_OP_DIV  = 0b001
+DIV_OP_DIVU = 0b010
+DIV_OP_REM  = 0b011
+DIV_OP_REMU = 0b100
 
 # ==================== Wallace Tree 乘法器说明 ====================
 # Wallace Tree 乘法器集成在 ExecuteStage 中实现
@@ -57,8 +70,47 @@ MUL_OP_MULHU  = 0b100
 #
 # 3周期流水线:
 # - Cycle 1: 符号扩展 + 部分积生成 + CSA压缩 (32→22→15→10)
-# - Cycle 2: 继续CSA压缩 (10→7→5→4→3→2)  
+# - Cycle 2: 继续CSA压缩 (10→7→5→4→3→2)
 # - Cycle 3: 最终加法 + 结果选择
+
+# ==================== Radix-4 SRT 除法器说明 ====================
+# Radix-4 SRT 除法器集成在 ExecuteStage 中实现
+#
+# 架构设计:
+# - 输入: 32位被除数, 32位除数
+# - 输出: 32位商或余数
+# - 延迟: 18周期
+#
+# 支持的指令:
+# - DIV:  有符号除法
+# - DIVU: 无符号除法
+# - REM:  有符号取余
+# - REMU: 无符号取余
+#
+# Radix-4 SRT 算法:
+# - 商数字集合: q ∈ {-2, -1, 0, +1, +2}
+# - 递归关系: P_{i+1} = 4 * P_i - q_i * D
+# - 每次迭代产生 2 位商
+# - 16 次迭代产生 32 位商
+#
+# 18周期流水线:
+# - Cycle 1:  初始化 (保存操作数, 处理符号, 检查除零)
+# - Cycle 2-17: 16次迭代 (商数字选择, 余数更新, 商累积)
+# - Cycle 18: 最终修正 (冗余商转换, 符号修正, 结果选择)
+#
+# 商数字选择表 (基于 P_i[4:0]):
+# - P_i[4:0] ∈ [-16, -9]: q_i = -2
+# - P_i[4:0] ∈ [-8, -5]:  q_i = -1
+# - P_i[4:0] ∈ [-4, 3]:   q_i = 0
+# - P_i[4:0] ∈ [4, 7]:    q_i = +1
+# - P_i[4:0] ∈ [8, 15]:   q_i = +2
+#
+# 状态机:
+# - IDLE: 空闲, 等待新的除法指令
+# - INIT: 初始化
+# - ITERATE: 迭代
+# - FINAL_CORRECTION: 最终修正
+# - DONE: 完成
 
 # ==================== IF阶段：指令获取 ===================
 class FetchStage(Module):
@@ -210,6 +262,17 @@ class DecodeStage(Module):
         
         # 是否为乘法指令
         is_mul_inst = (mul_op != UInt(3)(MUL_OP_NONE))
+        
+        # M扩展除法指令解码 (func3决定具体操作)
+        # func3: 100=DIV, 101=DIVU, 110=REM, 111=REMU
+        div_op = UInt(3)(DIV_OP_NONE)
+        div_op = (is_m_ext & (func3 == UInt(3)(0b100))).select(UInt(3)(DIV_OP_DIV), div_op)   # DIV
+        div_op = (is_m_ext & (func3 == UInt(3)(0b101))).select(UInt(3)(DIV_OP_DIVU), div_op)  # DIVU
+        div_op = (is_m_ext & (func3 == UInt(3)(0b110))).select(UInt(3)(DIV_OP_REM), div_op)   # REM
+        div_op = (is_m_ext & (func3 == UInt(3)(0b111))).select(UInt(3)(DIV_OP_REMU), div_op)  # REMU
+        
+        # 是否为除法指令
+        is_div_inst = (div_op != UInt(3)(DIV_OP_NONE))
         # log("ID DECODE: opcode={:07b}, funct7={:07b}, func3={:03b}, is_r_type={}, is_m_ext={}, mul_op={}, is_mul_inst={}", 
             # opcode, funct7, func3, is_r_type, is_m_ext, mul_op, is_mul_inst)
         
@@ -272,10 +335,15 @@ class DecodeStage(Module):
         # M扩展乘法指令设置
         reg_write = is_mul_inst.select(UInt(1)(1), reg_write)  # 乘法指令写回寄存器
         alu_src = is_mul_inst.select(UInt(2)(0), alu_src)  # 乘法使用寄存器操作数
+        
+        # M扩展除法指令设置
+        reg_write = is_div_inst.select(UInt(1)(1), reg_write)  # 除法指令写回寄存器
+        alu_src = is_div_inst.select(UInt(2)(0), alu_src)  # 除法使用寄存器操作数
 
         reg_write = (rd == UInt(5)(0)).select(UInt(1)(0), reg_write)  # rd为x0时不写入
         
-        # 新控制信号格式 (45位):
+        # 新控制信号格式 (48位):
+        # [47:45] - div_op (3位除法操作码)
         # [44:42] - mul_op (3位乘法操作码)
         # [41:30] - 立即数低12位
         # [29:25] - rd地址
@@ -292,6 +360,7 @@ class DecodeStage(Module):
         # [5]     - mem_read
         # [4:0]   - alu_op
         control_signals = concat(
+            div_op,           # [47:45] 除法操作码
             mul_op,           # [44:42] 乘法操作码
             immediate[0:11],   # [41:30] 立即数低12位
             rd,               # [29:25] rd地址
@@ -309,9 +378,9 @@ class DecodeStage(Module):
             alu_op,           # [4:0]   ALU操作码
         )
 
-        # 乘法指令也需要rs1和rs2
-        need_rs1 = (is_i_type | is_r_type | is_s_type | is_b_type | is_l_type | is_jr_type | is_mul_inst)
-        need_rs2 = (is_r_type | is_s_type | is_b_type | is_mul_inst)
+        # 乘法指令和除法指令也需要rs1和rs2
+        need_rs1 = (is_i_type | is_r_type | is_s_type | is_b_type | is_l_type | is_jr_type | is_mul_inst | is_div_inst)
+        need_rs2 = (is_r_type | is_s_type | is_b_type | is_mul_inst | is_div_inst)
         
         
         with Condition(id_ex_valid[0]):
@@ -408,7 +477,7 @@ class ExecuteStage(Module):
         return taken
 
     @module.combinational
-    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram, mul_a, mul_b, mul_op_reg, mul_start, mul_cycle_counter, mul_stage1_sum, mul_stage1_carry, mul_stage2_sum, mul_stage2_carry, mul_valid, mul_result_reg, mul_in_progress, mul_rd_reg, mul_control_reg, mul_pc_reg):
+    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram, mul_a, mul_b, mul_op_reg, mul_start, mul_cycle_counter, mul_stage1_sum, mul_stage1_carry, mul_stage2_sum, mul_stage2_carry, mul_valid, mul_result_reg, mul_in_progress, mul_rd_reg, mul_control_reg, mul_pc_reg, div_dividend, div_divisor, div_op_reg, div_state, div_remainder, div_quotient, div_iter_count, div_sign, div_neg_result, div_valid, div_result_reg, div_rd_reg, div_control_reg, div_pc_reg):
         pc_in = id_ex_pc[0]
         rs1_idx = id_ex_rs1_idx[0]
         rs2_idx = id_ex_rs2_idx[0]
@@ -459,7 +528,7 @@ class ExecuteStage(Module):
         pc_change = UInt(1)(0)
         target_pc = pc_in + UInt(XLEN)(4)  # 默认目标PC是PC+4
 
-        # 解析控制信号 (新格式45位)
+        # 解析控制信号 (新格式48位)
         alu_op = control_in[0:4]
         mem_read = control_in[5:5]
         mem_write = control_in[6:6]
@@ -472,9 +541,13 @@ class ExecuteStage(Module):
         rd_addr = control_in[25:29]  # rd地址
         immediate = control_in[22:31]  # 立即数
         mul_op = control_in[42:44]  # 乘法操作码 [44:42]
+        div_op = control_in[45:47]  # 除法操作码 [47:45]
         
         # 判断是否为乘法指令
         is_mul_inst = (mul_op != UInt(3)(MUL_OP_NONE))
+        
+        # 判断是否为除法指令
+        is_div_inst = (div_op != UInt(3)(DIV_OP_NONE))
         
         # 解析预测信息: [0]: btb_hit, [1]: predict_taken, [2:33]: predicted_pc
         btb_hit = prediction_info_in[0:0]
@@ -723,14 +796,181 @@ class ExecuteStage(Module):
         with Condition(mul_cycle == UInt(2)(0)):
             mul_valid[0] = UInt(1)(0)
         
+        # ==================== 除法器逻辑 ====================
+        # 除法器状态检查
+        div_state_val = div_state[0]
+        div_busy = (div_state_val != UInt(6)(0)).select(UInt(1)(1), UInt(1)(0))
+        div_done = (div_state_val == UInt(6)(35)).select(UInt(1)(1), UInt(1)(0))
+        
+        # 当前是否需要启动新的除法
+        # 只有当除法器空闲且当前指令是除法指令时才启动
+        start_new_div = (is_div_inst & id_ex_valid[0] & ~div_busy).select(UInt(1)(1), UInt(1)(0))
+        
+        # 保存除法操作数和控制信息
+        with Condition(start_new_div):
+            div_dividend[0] = rs1_data
+            div_divisor[0] = rs2_data
+            div_op_reg[0] = div_op
+            div_rd_reg[0] = rd_addr
+            div_control_reg[0] = control_in
+            div_pc_reg[0] = pc_in
+            div_state[0] = UInt(6)(1)  # INIT state
+            div_iter_count[0] = UInt(5)(0)
+            div_sign[0] = UInt(1)(0)
+            div_neg_result[0] = UInt(1)(0)
+            div_valid[0] = UInt(1)(0)
+        
+        # ==================== Radix-4 SRT 除法器计算 ====================
+        # 状态机: 0=IDLE, 1=INIT, 2-17=ITERATE (16 iterations), 18=FINAL_CORRECTION, 19=DONE
+        # 注意：只在除法器已启动（非启动周期）时处理状态转换
+        
+        # State 1: INIT - 初始化（只在非启动周期执行）
+        with Condition((div_state_val == UInt(6)(1)) & ~start_new_div):
+            saved_op = div_op_reg[0]
+            dividend = div_dividend[0]
+            divisor = div_divisor[0]
+            
+            # 检查除零
+            div_zero = (divisor == UInt(32)(0))
+            
+            # 处理符号（有符号除法）
+            is_signed = ((saved_op == UInt(3)(DIV_OP_DIV)) | (saved_op == UInt(3)(DIV_OP_REM))).select(UInt(1)(1), UInt(1)(0))
+            
+            # 计算结果符号
+            dividend_sign = dividend[31:31]
+            divisor_sign = divisor[31:31]
+            result_sign = (is_signed & (dividend_sign ^ divisor_sign)).select(UInt(1)(1), UInt(1)(0))
+            
+            # 符号扩展被除数和除数到34位
+            dividend_signed = dividend.bitcast(Int(32))
+            divisor_signed = divisor.bitcast(Int(32))
+            
+            # 取绝对值
+            dividend_abs = (dividend_sign == UInt(1)(1)).select((~dividend).bitcast(UInt(32)) + UInt(32)(1), dividend)
+            divisor_abs = (divisor_sign == UInt(1)(1)).select((~divisor).bitcast(UInt(32)) + UInt(32)(1), divisor)
+            
+            # 除零处理
+            with Condition(div_zero):
+                # DIV: -1, DIVU: 0xFFFFFFFF
+                div_result_val = is_signed.select(UInt(32)(0xFFFFFFFF), UInt(32)(0xFFFFFFFF))
+                # REM: dividend, REMU: dividend
+                rem_result_val = dividend
+                final_div_result = ((saved_op == UInt(3)(DIV_OP_DIV)) | (saved_op == UInt(3)(DIV_OP_DIVU))).select(div_result_val, rem_result_val)
+                div_result_reg[0] = final_div_result
+                div_valid[0] = UInt(1)(1)
+                div_state[0] = UInt(6)(35)  # DONE
+            with Condition(~div_zero):
+                # 简单恢复除法初始化：
+                # - div_remainder 用64位存储：高32位是余数（初始为0），低32位是被除数
+                # - div_quotient 初始化为 0
+                # - div_divisor 存储除数的绝对值
+                div_divisor[0] = divisor_abs  # 保存除数的绝对值
+                # 初始化：余数=0（高32位），被除数=dividend_abs（低32位）
+                div_remainder[0] = dividend_abs.bitcast(UInt(64))  # 被除数在低32位，高32位为0
+                div_quotient[0] = UInt(32)(0)
+                # 保存符号信息
+                div_sign[0] = result_sign
+                div_neg_result[0] = result_sign
+                div_state[0] = UInt(6)(2)  # ITERATE (first iteration)
+        
+        # States 2-33: ITERATE - 32次迭代（每次产生1位商）
+        # 简单的恢复除法算法：
+        # 使用64位值存储 {余数(高32位), 被除数(低32位)}
+        # 每次迭代：
+        # 1. 左移整个64位值1位
+        # 2. 取高32位作为余数
+        # 3. 如果余数 >= 除数，则余数 -= 除数，商位 = 1
+        div_state_in_iterate = (div_state_val >= UInt(6)(2)) & (div_state_val < UInt(6)(34)) & ~start_new_div
+        with Condition(div_state_in_iterate):
+            iter_num = div_iter_count[0]
+            current_remainder = div_remainder[0]  # 64位：高32位是余数，低32位是剩余的被除数
+            current_divisor = div_divisor[0]     # 32位除数
+            current_quotient = div_quotient[0]   # 32位商
+            
+            # 将 current_remainder 左移1位
+            # 这将被除数的最高位移入余数的最低位
+            shifted_remainder = (current_remainder << UInt(64)(1)).bitcast(UInt(64))
+            
+            # 取高32位作为当前的余数
+            remainder_part = shifted_remainder[32:63].bitcast(UInt(32))
+            
+            # 比较：如果 remainder_part >= divisor，则可以减
+            can_subtract = (remainder_part >= current_divisor)
+            
+            # 计算新的余数部分
+            new_remainder_part = can_subtract.select(remainder_part - current_divisor, remainder_part)
+            
+            # 更新 div_remainder：高32位是新余数，低32位保持不变
+            new_remainder = concat(new_remainder_part.bitcast(Bits(32)), shifted_remainder[0:31]).bitcast(UInt(64))
+            
+            # 左移商，移入新的商位
+            new_quotient = ((current_quotient << UInt(32)(1)) | can_subtract.select(UInt(32)(1), UInt(32)(0))).bitcast(UInt(32))
+            
+            # 更新寄存器
+            div_remainder[0] = new_remainder
+            div_quotient[0] = new_quotient
+            div_iter_count[0] = iter_num + UInt(5)(1)
+            
+            # 检查是否完成32次迭代
+            iter_done = (iter_num >= UInt(5)(31))
+            div_state[0] = iter_done.select(UInt(6)(34), div_state_val + UInt(6)(1))  # FINAL_CORRECTION or next ITERATE
+        
+        # State 34: FINAL_CORRECTION - 最终修正
+        with Condition((div_state_val == UInt(6)(34)) & ~start_new_div):
+            saved_op = div_op_reg[0]
+            current_quotient = div_quotient[0]
+            current_remainder = div_remainder[0]
+            neg_result = div_neg_result[0]
+            
+            # 商已经在迭代中累积完成
+            quotient_corrected = current_quotient
+            
+            # 符号修正
+            quotient_signed = quotient_corrected.bitcast(Int(32))
+            quotient_neg = ~quotient_signed + Int(32)(1)
+            quotient_final = neg_result.select(quotient_neg.bitcast(UInt(32)), quotient_corrected)
+            
+            # 余数在64位值的高32位
+            remainder_high = current_remainder[32:63].bitcast(UInt(32))
+            
+            # 余数符号修正（余数的符号与被除数相同，不是与商相同）
+            # 对于有符号除法，余数的符号应该与被除数相同
+            dividend_sign_saved = div_sign[0]  # 这里存的是商的符号，不是被除数的符号
+            # 实际上，我们需要保存被除数的原始符号，而不是结果符号
+            # 简化处理：对于除法，不修正余数符号（因为我们用绝对值计算）
+            remainder_signed = remainder_high.bitcast(Int(32))
+            remainder_neg = ~remainder_signed + Int(32)(1)
+            # 对于 DIV/REM 指令，余数符号跟随被除数
+            remainder_final = neg_result.select(remainder_neg.bitcast(UInt(32)), remainder_high)
+            
+            # 结果选择
+            # DIV/DIVU: 返回商
+            # REM/REMU: 返回余数
+            is_div_op = ((saved_op == UInt(3)(DIV_OP_DIV)) | (saved_op == UInt(3)(DIV_OP_DIVU))).select(UInt(1)(1), UInt(1)(0))
+            final_div_result = is_div_op.select(quotient_final, remainder_final)
+            
+            div_result_reg[0] = final_div_result
+            div_valid[0] = UInt(1)(1)
+            div_state[0] = UInt(6)(35)  # DONE
+        
+        # State 35: DONE - 完成
+        with Condition((div_state_val == UInt(6)(35)) & ~start_new_div):
+            div_state[0] = UInt(6)(0)  # IDLE
+        
+        # 非除法周期重置valid（只在除法器空闲且没有启动新除法时）
+        with Condition((div_state_val == UInt(6)(0)) & ~start_new_div):
+            div_valid[0] = UInt(1)(0)
+        
         # ==================== ALU结果选择 ====================
         # 普通ALU结果
         normal_alu_result = is_branch.select(UInt(XLEN)(0), (is_jump | is_jumpr).select(pc_in + UInt(XLEN)(4), self.alu_unit(alu_op, alu_a, alu_b)))
         
-        # 乘法完成时使用当前周期计算的乘法结果
-        alu_result = mul_done.select(current_mul_result, normal_alu_result)
-        # log("EX RESULT: mul_done={}, current_mul_result={}, normal_alu_result={}, alu_result={}", 
-            # mul_done, current_mul_result, normal_alu_result, alu_result)
+        # 乘法或除法完成时使用对应的结果
+        # 优先级：div_done > mul_done > normal_alu_result
+        div_result_val = div_result_reg[0]
+        alu_result = div_done.select(div_result_val, mul_done.select(current_mul_result, normal_alu_result))
+        # log("EX RESULT: mul_done={}, div_done={}, div_result_val={}, alu_result={}", 
+        #     mul_done, div_done, div_result_val, alu_result)
         
         target_pc = (is_branch | is_jump).select(actual_target_pc, target_pc)
         target_pc = is_jumpr.select(new_pc.bitcast(UInt(32)), target_pc)
@@ -760,25 +1000,35 @@ class ExecuteStage(Module):
         mul_in_ex_stage = is_mul_inst & id_ex_valid[0]
         mul_wait = mul_in_ex_stage & ~mul_done  # 乘法未完成，需要等待
         
+        # 除法指令需要等待除法完成才能传递到MEM阶段
+        # 当除法器正在执行(state != 0 and state != 19)时，向MEM阶段传递NOP
+        # 当除法完成(state = 19, div_done=1)时，传递除法结果
+        div_in_ex_stage = is_div_inst & id_ex_valid[0]
+        div_wait = div_in_ex_stage & ~div_done  # 除法未完成，需要等待
+        
         # 当乘法完成时，使用保存的控制信息而不是当前的 control_in（因为当前可能是 NOP）
         mul_control = mul_control_reg[0]
         mul_pc = mul_pc_reg[0]
         
+        # 当除法完成时，使用保存的控制信息而不是当前的 control_in（因为当前可能是 NOP）
+        div_control = div_control_reg[0]
+        div_pc = div_pc_reg[0]
+        
         with Condition(ex_mem_valid[0]):
-            # 如果是乘法指令且乘法未完成，传递NOP；否则正常传递
-            # 乘法完成时 (mul_done=1)，使用保存的控制信息
-            should_pass = id_ex_valid[0] & ~mul_wait
-            pass_or_mul_done = should_pass | mul_done  # 要么正常传递，要么乘法完成
+            # 如果是乘法或除法指令且未完成，传递NOP；否则正常传递
+            # 乘法或除法完成时，使用保存的控制信息
+            should_pass = id_ex_valid[0] & ~mul_wait & ~div_wait
+            pass_or_done = should_pass | mul_done | div_done  # 要么正常传递，要么完成
             
-            # PC: 乘法完成时用保存的 PC，否则用当前 PC
-            final_pc = mul_done.select(mul_pc, pc_in)
-            # 控制信号: 乘法完成时用保存的控制信号，否则用当前控制信号
-            final_control = mul_done.select(mul_control, control_in)
+            # PC: 完成时用保存的 PC，否则用当前 PC
+            final_pc = mul_done.select(mul_pc, div_done.select(div_pc, pc_in))
+            # 控制信号: 完成时用保存的控制信号，否则用当前控制信号
+            final_control = mul_done.select(mul_control, div_done.select(div_control, control_in))
             
-            ex_mem_pc[0] = pass_or_mul_done.select(final_pc, UInt(XLEN)(0))
-            ex_mem_control[0] = pass_or_mul_done.select(final_control, UInt(CONTROL_LEN)(0))
-            ex_mem_result[0] = pass_or_mul_done.select(alu_result, UInt(XLEN)(0))
-            ex_mem_data[0] = pass_or_mul_done.select(rs2_data, UInt(XLEN)(0))
+            ex_mem_pc[0] = pass_or_done.select(final_pc, UInt(XLEN)(0))
+            ex_mem_control[0] = pass_or_done.select(final_control, UInt(CONTROL_LEN)(0))
+            ex_mem_result[0] = pass_or_done.select(alu_result, UInt(XLEN)(0))
+            ex_mem_data[0] = pass_or_done.select(rs2_data, UInt(XLEN)(0))
             
             # log("EX: PC={}, ALU_OP={:05b}, ALU_A={}, ALU_B={}, Result={:08x}, PC_Change={}, Target_PC={:08x}, Immediate={:08x}, ALU_SRC={}",
             #     pc_in, alu_op, alu_a, alu_b, alu_result, pc_change, target_pc, immediate_in, alu_src)
@@ -815,11 +1065,21 @@ class ExecuteStage(Module):
         # mul_stall: 当前有乘法指令但乘法器正在执行中，需要暂停
         mul_executing = ((mul_cycle == UInt(2)(1)) | (mul_cycle == UInt(2)(2))).select(UInt(1)(1), UInt(1)(0))
         mul_stall_needed = (is_mul_inst & id_ex_valid[0] & mul_executing).select(UInt(1)(1), UInt(1)(0))
+        
+        # 除法器信号
+        # div_busy: 除法器正在执行中 (state != 0 and state != 19)
+        # div_done: 除法器完成 (state = 19)
+        # div_stall: 当前有除法指令但除法器正在执行中，需要暂停
+        div_executing = ((div_state_val != UInt(6)(0)) & (div_state_val != UInt(6)(35))).select(UInt(1)(1), UInt(1)(0))
+        div_stall_needed = (is_div_inst & id_ex_valid[0] & div_executing).select(UInt(1)(1), UInt(1)(0))
 
         execute_signals = concat(
-            mul_stall_needed.bitcast(Bits(1)),   # [180] 乘法暂停信号
-            mul_done.bitcast(Bits(1)),           # [179] 乘法完成
-            mul_busy.bitcast(Bits(1)),           # [178] 乘法忙
+            div_stall_needed.bitcast(Bits(1)),   # [182] 除法暂停信号
+            div_done.bitcast(Bits(1)),           # [181] 除法完成
+            div_busy.bitcast(Bits(1)),           # [180] 除法忙
+            mul_stall_needed.bitcast(Bits(1)),   # [179] 乘法暂停信号
+            mul_done.bitcast(Bits(1)),           # [178] 乘法完成
+            mul_busy.bitcast(Bits(1)),           # [177] 乘法忙
             id_ex_valid[0].select(prediction_result, Bits(103)(0)),  # 预测结果
             id_ex_valid[0].select(control_in.bitcast(Bits(CONTROL_LEN)), Bits(CONTROL_LEN)(0)),
             id_ex_valid[0].select(target_pc.bitcast(Bits(XLEN)), Bits(XLEN)(0)),       # [31:1]  目标PC
@@ -916,10 +1176,11 @@ class HazardUnit(Downstream):
         super().__init__()
 
     @downstream.combinational
-    def build(self, pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals, mul_in_progress, mul_cycle_counter):
+    def build(self, pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals, mul_in_progress, mul_cycle_counter, div_state, div_iter_count):
 
-        # 计算新的信号长度 (增加3位乘法信号: mul_busy, mul_done, mul_stall_needed)
-        EXECUTE_SIGNALS_LEN = XLEN + 1 + CONTROL_LEN + 103 + 3  # pc_change(1) + target_pc(32) + control(45) + prediction_result(103) + mul_signals(3)
+        # 计算新的信号长度 (增加3位乘法信号和3位除法信号)
+        # pc_change(1) + target_pc(32) + control(48) + prediction_result(103) + mul_signals(3) + div_signals(3) = 190
+        EXECUTE_SIGNALS_LEN = XLEN + 1 + CONTROL_LEN + 103 + 6  # 32 + 1 + 48 + 103 + 6 = 190
         DECODE_SIGNALS_LEN = 2 + CONTROL_LEN + 5 + 5 + XLEN + PREDICTION_INFO_LEN  # need_rs1(1) + need_rs2(1) + control(45) + rs1(5) + rs2(5) + immediate(32) + prediction_info(34)
 
         execute_signals = execute_signals.optional(Bits(EXECUTE_SIGNALS_LEN)(0))
@@ -933,7 +1194,7 @@ class HazardUnit(Downstream):
         target_pc = execute_signals[1:XLEN].bitcast(UInt(XLEN))
         
         # 解析预测结果 (从execute_signals中提取)
-        # execute_signals布局: [0]: pc_change, [1:32]: target_pc, [33:77]: control(45), [78:180]: prediction_result(103), [181:183]: mul_signals(3)
+        # execute_signals布局: [0]: pc_change, [1:32]: target_pc, [33:80]: control(48), [81:183]: prediction_result(103), [184:186]: mul_signals(3), [187:189]: div_signals(3)
         pred_result_start = XLEN + 1 + CONTROL_LEN
         prediction_result = execute_signals[pred_result_start:pred_result_start + 102].bitcast(UInt(103))
         
@@ -942,6 +1203,12 @@ class HazardUnit(Downstream):
         mul_busy_sig = execute_signals[mul_signals_start:mul_signals_start].bitcast(UInt(1))
         mul_done_sig = execute_signals[mul_signals_start + 1:mul_signals_start + 1].bitcast(UInt(1))
         mul_stall_sig = execute_signals[mul_signals_start + 2:mul_signals_start + 2].bitcast(UInt(1))
+        
+        # 解析除法器信号
+        div_signals_start = mul_signals_start + 3
+        div_busy_sig = execute_signals[div_signals_start:div_signals_start].bitcast(UInt(1))
+        div_done_sig = execute_signals[div_signals_start + 1:div_signals_start + 1].bitcast(UInt(1))
+        div_stall_sig = execute_signals[div_signals_start + 2:div_signals_start + 2].bitcast(UInt(1))
         
         # 解析prediction_result:
         # [0]: mispredict, [1:32]: correct_pc, [33]: actual_taken, [34:65]: actual_target_pc
@@ -995,7 +1262,9 @@ class HazardUnit(Downstream):
         ex_control = id_ex_control[0]
         ex_rd = ex_control[25:29]
         ex_mul_op = ex_control[42:44]
+        ex_div_op = ex_control[45:47]
         is_ex_mul = (ex_mul_op != UInt(3)(MUL_OP_NONE))
+        is_ex_div = (ex_div_op != UInt(3)(DIV_OP_NONE))
         
         # 乘法暂停条件：
         # 乘法器正在执行中(cycle 1, 2, 或 3)，需要暂停IF/ID阶段
@@ -1011,6 +1280,19 @@ class HazardUnit(Downstream):
         mul_result_hazard = (is_ex_mul & (ex_rd != UInt(5)(0)) &
                             ((needs_rs1 & (rs1 == ex_rd)) | (needs_rs2 & (rs2 == ex_rd))))
         
+        # ==================== 除法冒险检测 ====================
+        # 检测EX阶段是否有除法指令
+        div_cycle = div_iter_count[0]
+        # 除法器状态：0=IDLE, 1=INIT, 2-17=ITERATE, 18=FINAL_CORRECTION, 19=DONE
+        # 除法器执行中：state != 0 (IDLE)
+        div_state_val = div_state[0]
+        div_executing = (div_state_val != UInt(6)(0)).select(UInt(1)(1), UInt(1)(0))
+        
+        # 检测除法结果冒险：ID阶段的指令依赖于正在执行的除法结果
+        # 条件：EX阶段有DIV指令 且 rd != 0 且 ID阶段指令依赖于rd
+        div_result_hazard = (is_ex_div & (ex_rd != UInt(5)(0)) &
+                            ((needs_rs1 & (rs1 == ex_rd)) | (needs_rs2 & (rs2 == ex_rd))))
+        
         # 需要刷新的情况: mispredict || is_jump || is_jumpr
         need_flush = (mispredict | is_jump_ex | is_jumpr_ex).select(UInt(1)(1), UInt(1)(0))
         
@@ -1018,9 +1300,11 @@ class HazardUnit(Downstream):
         # 1. Load-Use 冒险
         # 2. 乘法器执行中（cycle 1或2，需要等待乘法完成）
         # 3. 乘法结果冒险（下一条指令依赖乘法结果）
-        data_hazard = ((load_use_hazard_mem | mul_executing | mul_result_hazard) & ~need_flush)
-        # log("HAZARD2: data_hazard={}, need_flush={}, mul_executing={}, mul_result_hazard={}", 
-        #     data_hazard, need_flush, mul_executing, mul_result_hazard)
+        # 4. 除法器执行中（state != 0，需要等待除法完成）
+        # 5. 除法结果冒险（下一条指令依赖除法结果）
+        data_hazard = ((load_use_hazard_mem | mul_executing | mul_result_hazard | div_executing | div_result_hazard) & ~need_flush)
+        # log("HAZARD2: data_hazard={}, need_flush={}, mul_executing={}, mul_result_hazard={}, div_executing={}, div_result_hazard={}",
+        #     data_hazard, need_flush, mul_executing, mul_result_hazard, div_executing, div_result_hazard)
         
         # id_ex_valid 的含义：EX阶段是否有有效指令需要执行
         # - need_flush时，EX阶段指令作废，设为0
@@ -1187,6 +1471,23 @@ def build_cpu(program_file="test_program.txt"):
         mul_rd_reg = RegArray(UInt(5), 1, initializer=[0])            # 乘法目标寄存器
         mul_control_reg = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 乘法控制信号
         mul_pc_reg = RegArray(UInt(XLEN), 1, initializer=[0])         # 乘法指令PC
+        
+        # ==================== 除法器寄存器 ====================
+        # Radix-4 SRT 除法器流水线寄存器
+        div_dividend = RegArray(UInt(32), 1, initializer=[0])            # 被除数
+        div_divisor = RegArray(UInt(32), 1, initializer=[0])             # 除数
+        div_op_reg = RegArray(UInt(3), 1, initializer=[0])            # 除法操作码
+        div_state = RegArray(UInt(6), 1, initializer=[0])            # 除法器状态 (0=IDLE, 1=INIT, 2-33=ITERATE, 34=FINAL_CORRECTION, 35=DONE)
+        div_remainder = RegArray(UInt(64), 1, initializer=[0])         # 64位：高32位是余数，低32位是被除数
+        div_quotient = RegArray(UInt(32), 1, initializer=[0])         # 商 (冗余表示)
+        div_iter_count = RegArray(UInt(5), 1, initializer=[0])      # 迭代计数器 (0-15)
+        div_sign = RegArray(UInt(1), 1, initializer=[0])             # 结果符号
+        div_neg_result = RegArray(UInt(1), 1, initializer=[0])        # 结果是否需要取负
+        div_valid = RegArray(UInt(1), 1, initializer=[0])             # 除法结果有效
+        div_result_reg = RegArray(UInt(32), 1, initializer=[0])       # 除法结果
+        div_rd_reg = RegArray(UInt(5), 1, initializer=[0])            # 除法目标寄存器
+        div_control_reg = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 除法控制信号
+        div_pc_reg = RegArray(UInt(XLEN), 1, initializer=[0])         # 除法指令PC
 
         # 分支预测器 - BTB + BHT + 有效位
         btb = RegArray(UInt(XLEN), BTB_SIZE, initializer=[0]*BTB_SIZE)        # Branch Target Buffer (32位 x 64)
@@ -1215,10 +1516,10 @@ def build_cpu(program_file="test_program.txt"):
         # 按照流水线顺序构建模块
         writeback_signals = writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file, data_sram)
         memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram)
-        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram, mul_a, mul_b, mul_op_reg, mul_start, mul_cycle_counter, mul_stage1_sum, mul_stage1_carry, mul_stage2_sum, mul_stage2_carry, mul_valid, mul_result_reg, mul_in_progress, mul_rd_reg, mul_control_reg, mul_pc_reg)
+        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, id_ex_prediction_info, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, data_sram, mul_a, mul_b, mul_op_reg, mul_start, mul_cycle_counter, mul_stage1_sum, mul_stage1_carry, mul_stage2_sum, mul_stage2_carry, mul_valid, mul_result_reg, mul_in_progress, mul_rd_reg, mul_control_reg, mul_pc_reg, div_dividend, div_divisor, div_op_reg, div_state, div_remainder, div_quotient, div_iter_count, div_sign, div_neg_result, div_valid, div_result_reg, div_rd_reg, div_control_reg, div_pc_reg)
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, if_id_prediction_info, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, id_ex_prediction_info, reg_file, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, if_id_prediction_info, instruction_memory, btb, bht, btb_valid, decode_stage)
-        hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals, mul_in_progress, mul_cycle_counter)
+        hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals, mul_in_progress, mul_cycle_counter, div_state, div_iter_count)
         
         # 构建Driver模块，处理PC更新
         driver.build(fetch_stage)

@@ -1,0 +1,43 @@
+
+fac.elf:     file format elf32-littleriscv
+
+
+Disassembly of section .text:
+
+00000000 <_start>:
+   0:	00004137          	lui	sp,0x4
+   4:	00000097          	auipc	ra,0x0
+   8:	00c080e7          	jalr	12(ra) # 10 <main>
+
+0000000c <loop>:
+   c:	0000006f          	j	c <loop>
+
+00000010 <main>:
+  10:	fe010113          	addi	sp,sp,-32 # 3fe0 <main+0x3fd0>
+  14:	00812e23          	sw	s0,28(sp)
+  18:	02010413          	addi	s0,sp,32
+  1c:	00100793          	li	a5,1
+  20:	fef42623          	sw	a5,-20(s0)
+  24:	00100793          	li	a5,1
+  28:	fef42423          	sw	a5,-24(s0)
+  2c:	0200006f          	j	4c <main+0x3c>
+  30:	fe842703          	lw	a4,-24(s0)
+  34:	fec42783          	lw	a5,-20(s0)
+  38:	02f707b3          	mul	a5,a4,a5
+  3c:	fef42423          	sw	a5,-24(s0)
+  40:	fec42783          	lw	a5,-20(s0)
+  44:	00178793          	addi	a5,a5,1
+  48:	fef42623          	sw	a5,-20(s0)
+  4c:	fec42703          	lw	a4,-20(s0)
+  50:	00a00793          	li	a5,10
+  54:	fce7dee3          	bge	a5,a4,30 <main+0x20>
+  58:	fe842703          	lw	a4,-24(s0)
+  5c:	ffc8a7b7          	lui	a5,0xffc8a
+  60:	10078793          	addi	a5,a5,256 # ffc8a100 <main+0xffc8a0f0>
+  64:	00f707b3          	add	a5,a4,a5
+  68:	00f037b3          	snez	a5,a5
+  6c:	0ff7f793          	andi	a5,a5,255
+  70:	00078513          	mv	a0,a5
+  74:	01c12403          	lw	s0,28(sp)
+  78:	02010113          	addi	sp,sp,32
+  7c:	00008067          	ret
