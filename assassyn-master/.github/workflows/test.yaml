@@ -1,0 +1,56 @@
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+name: Test
+
+jobs:
+  test:
+    name: Test
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          override: true
+      
+      - name: Apply Patches
+        run: |
+          make patch-all
+
+      - name: Get Submodule Hashes
+        id: submodule-hashes
+        run: |
+          echo "circt-hash=$(git rev-parse HEAD:3rd-party/circt)" >> $GITHUB_OUTPUT
+          echo "verilator-hash=$(git rev-parse HEAD:3rd-party/verilator)" >> $GITHUB_OUTPUT
+          echo "ramulator2-hash=$(git rev-parse HEAD:3rd-party/ramulator2)" >> $GITHUB_OUTPUT
+
+      - name: Build All Components
+        run: |
+          echo "Building all components"
+          . setup.sh && make build-all
+      
+      - name: Run All Tests
+        run: |
+          . setup.sh && make test-all
+
+      - name: Run Array Increment Example Test
+        run: |
+          . setup.sh && python examples/array-increment/main.py
+
+      - name: Clean CMake Cache
+        run: |
+          find . -name "CMakeCache.txt" -delete
+          find . -name "CMakeFiles" -type d -exec rm -rf {} + 2>/dev/null || true
+          make clean-all
+      
+     

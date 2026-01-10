@@ -1,0 +1,4 @@
+*.pyc
+output.log
+*_simulator
+workspace

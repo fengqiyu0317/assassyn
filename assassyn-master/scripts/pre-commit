@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# It is highly recommended to put this to your git pre-commit hook, to format your code
+# before checking anything in.
+
+# Run Rust linting (fmt and clippy)
+echo "Running Rust linting..."
+make rust-lint
+if [ $? -ne 0 ]; then
+    echo "Error: Rust linting failed. Please fix the issues above."
+    exit 1
+fi
+
+# Run Python linting
+echo "Running Python linting..."
+make pylint
+if [ $? -ne 0 ]; then
+    echo "Error: Python linting failed. Please fix the issues above."
+    exit 1
+fi
+
+# Ensure ramulator2 and wrapper are built
+make test-all

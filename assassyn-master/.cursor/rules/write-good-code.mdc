@@ -1,0 +1,81 @@
+---
+alwaysApply: true
+---
+
+# Write Good Code
+
+This document discusses several key rules of writing good code:
+
+1. When introducing a new wrapper like below, ask yourself do we really need such an indirection.
+   - These indirections including, but not limited to struct/class wrappers, and function wrappers.
+   - If you do a wrapper like below, carefully think if it is it because we designed a poor interface. before.
+```python
+def foo_wrapper(a):
+    foo(a, 0)
+```
+   - Do NOT even try to write a wrapper like below, which is totally redundant!
+```python
+def _foo_wrapper(a):
+   a.foo()
+
+class A:
+   a: int
+   b: int
+
+class AWrapper:
+   wrapped_a: int
+   wrapped_b: int
+
+a = A()
+wrapper = AWrapper(a)
+```
+
+2. When writing a set of repeat code, consider to refine a unified interface. If you write a repeat code
+   twice, you have a chance to write it more times. If similar code is distributed everywhere, you need
+   to modify it everywhere, which not only worsens the readability but also lengthens the contexts.
+   - However, focus on one thing at a time. If you realize it is a over engineering, report it in the summary.
+
+3. Focus on thing for each module. If a module is originally designed for a purpose, do not borrow its code
+   path for anything else, unless the addition is a part of feature extension closely related to this module.
+   - Do not reinvent infrastructures! If you need a handy helper for some usage. First check if
+     this is already available in the related data structures' member methods, and find if it is available
+     in `python/assassyn/analysis` and `python/assassyn/utils`.
+   - If not, carefully differentiate your requirements! If this is a common usage missing in the corresponding
+     struct, bravely add it! If this is a usage only limited to the module you are developing, keep this helper
+     private to this function!
+   - If it is an IR-wise analysis and operation, use the visitor-pattern base class implemented in
+     `python/assassyn/ir/visitor.py`.
+
+4. Make a clear boundary between interface declaration, usage, and error handling, especially for
+   the managed languages like Python, as the attribute addition and remove it super flexible.
+   - It is preferred to use `@dataclass`, even frozen, to create Python structs so that all the attributes
+     are already determined. UNLESS NO OTHER WAYS, DO NOT use `getattr` and `setattr` to access the attributes.
+```python
+@dataclass
+class Coord:
+   x: float
+   y: float
+```
+   - It is the accessers' duty to handle the `None`.  If an attribute is not available upon usage,
+     carefully consider: if this attribute is mandatory? If so, raise and error. If not, give a default value.
+     DO NOT handle this at usage sites, as it breaks point 2 above. That is repeatitive code.
+
+5. DO NOT hard code. If you have a constant value defined for a specific purpose, when used do not hard code
+   its literal value. Is is possible to:
+     - Make this value a constant variable and use this variable?
+     - Change it to a enum to avoid other mistakes?
+
+6. Low invasion. Every time you make a mofication, carefully control the files are affective.
+   Unless you are sure you are told to do an interface refactor, make sure all the modifications
+   should be inside the module and the interface exposed by the module.
+
+7. When creating a Python function, remember to annotate the signature with types
+   - DO NOT use str to annotate the types
+   - USE `typing.TYPE_CHECKING` to import the required types and prevent cyclic imports
+   - Remember to annotate the function with `enforce_type` in `python/assassyn/utils/enforce_type.py`
+```python
+if typing.TYPE_CHECKING
+   import <types for annotation>
+else
+   <types for annotation> = typing.Any
+```

@@ -4,5 +4,5 @@ int main() {
         sum += i;
         i++;
     }
-    return 0;
+    return sum;
 }

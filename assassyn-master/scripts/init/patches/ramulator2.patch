@@ -1,0 +1,11 @@
+src/base/param.h
+-          return _config[_name].as<T>();
++          return _config[_name].template as<T>();
+
+src/dram_controller/impl/generic_dram_controller.cpp
+-            // TODO: Add code to update statistics
++            // NEW: mirror read handling for writes
++            // Prefer a dedicated write latency if your DRAM model exposes it; else reuse read latency for now.
++            auto write_lat = m_dram->m_read_latency; // fallback for POC
++            req_it->depart = m_clk + write_lat;
++            pending.push_back(*req_it);

@@ -1,0 +1,3 @@
+frontends/PyCDE/setup.py
+-      cmake_args += ["-DESI_RUNTIME=ON"]
++      cmake_args += ["-DESI_RUNTIME=OFF"]
