@@ -515,7 +515,7 @@ class ExecuteStage(Module):
         rs2_reg = reg_file[rs2_idx]
         
         # 解析 MEM 阶段控制信号（来自 EX/MEM 寄存器）用于前递
-        mem_control = ex_sig_control[0]
+        mem_control = ex_mem_control[0]
         mem_reg_write = mem_control[7:7]  # reg_write 在第7位
         mem_rd = mem_control[25:29]       # rd 在第25-29位
         mem_result = ex_mem_result[0]     # MEM 阶段的 ALU 结果
