@@ -16,7 +16,7 @@ from assassyn.ir.module import downstream, Downstream
 # ==================== 常量定义 ===================
 XLEN = 32  # RISC-V XLEN
 REG_COUNT = 32  # 通用寄存器数量
-CONTROL_LEN = 51 # 控制信号长度 (48 + 2位load_type + 1位load_unsigned)
+CONTROL_LEN = 48 # 控制信号长度 (42 + 3位mul_op + 3位div_op)
 BTB_SIZE = 64  # BTB表大小
 BTB_INDEX_BITS = 6  # BTB索引位数 (log2(64)=6)
 PREDICTION_INFO_LEN = 34  # 预测信息长度: [0]: btb_hit, [1]: predict_taken, [2:33]: predicted_pc
@@ -180,10 +180,8 @@ class DecodeStage(Module):
         instruction = if_id_instruction[0]
         prediction_info_in = if_id_prediction_info[0]
 
-        # Log instruction for debugging
-        with Condition(if_id_valid[0]):
-            log("Instruction: PC={:08x}, inst={:08x}, opcode={:07b}", if_id_pc_in, instruction, instruction[0:6].bitcast(UInt(7)))
-
+        # log("Instruction={:08x}", instruction)
+        
         # 如果指令无效，直接返回，不更新ID/EX寄存器
         opcode = instruction[0:6]          # bits 6:0
         rd = instruction[7:11]             # bits 11:7
@@ -193,19 +191,14 @@ class DecodeStage(Module):
         funct7 = instruction[25:31]         # bits 31:25
 
         # 提取立即数 - 使用手动符号扩展
-        # I型立即数 (12位有符号数) - bits [31:20]
-        imm_i_bits = instruction[20:31]  # Extract bits 20-31 (12 bits, Assassyn: [l:r] is inclusive)
+        # I型立即数 (12位有符号数)
+        imm_i_bits = instruction[20:31]
         sign_bit_i = imm_i_bits[11:11]  # 获取符号位
         # 手动扩展符号位：如果符号位为1，则高位全为1；否则为0
         immediate_i = (sign_bit_i == UInt(1)(1)).select(
             concat(Bits(20)(0xFFFFF), imm_i_bits).bitcast(UInt(32)),  # 负数扩展
             concat(Bits(20)(0x00000), imm_i_bits).bitcast(UInt(32))   # 正数扩展
         )
-
-        # Debug: log I-type immediate extraction for JALR
-        with Condition(opcode == UInt(7)(0b1100111)):  # JALR opcode
-            log("JALR DECODE: PC={:08x}, inst={:08x}, imm_i_bits={}, immediate_i={}",
-                if_id_pc_in, instruction, imm_i_bits, immediate_i)
         
         # S型立即数 (12位有符号数)
         imm_s_bits = concat(instruction[25:31], instruction[7:11])
@@ -305,31 +298,7 @@ class DecodeStage(Module):
         mem_to_reg = is_l_type.select(UInt(1)(1), mem_to_reg)  # LW (Load Word)
         alu_src = is_l_type.select(UInt(2)(1), alu_src)
         immediate = is_l_type.select(immediate_i, immediate)
-
-        # Load type decoding: 00=LB/LBU, 01=LH/LHU, 10=LW
-        # RISC-V load instruction func3 encoding:
-        # 000 = LB  (Load Byte, sign-extend)
-        # 001 = LH  (Load Half-word, sign-extend)
-        # 010 = LW  (Load Word, sign-extend)
-        # 100 = LBU (Load Byte, zero-extend)
-        # 101 = LHU (Load Half-word, zero-extend)
-        load_type_bits = UInt(2)(0)
-        load_type_bits = (is_l_type & (func3 == UInt(3)(0b010))).select(UInt(2)(0b10), load_type_bits)  # LW
-        load_type_bits = (is_l_type & (func3 == UInt(3)(0b000))).select(UInt(2)(0b00), load_type_bits)  # LB
-        load_type_bits = (is_l_type & (func3 == UInt(3)(0b001))).select(UInt(2)(0b01), load_type_bits)  # LH
-        load_type_bits = (is_l_type & (func3 == UInt(3)(0b100))).select(UInt(2)(0b00), load_type_bits)  # LBU (use LB type)
-        load_type_bits = (is_l_type & (func3 == UInt(3)(0b101))).select(UInt(2)(0b01), load_type_bits)  # LHU (use LH type)
-
-        # Unsigned load flag: 1=LBU/LHU, 0=LB/LH/LW
-        load_unsigned = UInt(1)(0)
-        load_unsigned = (is_l_type & (func3 == UInt(3)(0b100))).select(UInt(1)(1), load_unsigned)  # LBU
-        load_unsigned = (is_l_type & (func3 == UInt(3)(0b101))).select(UInt(1)(1), load_unsigned)  # LHU
-
-        # Debug logging for load type decoding
-        with Condition(is_l_type):
-            log("ID DECODE: PC={}, func3={}, is_l_type=1, load_type={}, load_unsigned={}",
-                if_id_pc_in, func3, load_type_bits, load_unsigned)
-
+            
         store_type_bits = UInt(2)(0)
         mem_write = is_s_type.select(UInt(1)(1), mem_write)  # SW (Store Word)
         alu_src = is_s_type.select(UInt(2)(1), alu_src)
@@ -373,59 +342,41 @@ class DecodeStage(Module):
 
         reg_write = (rd == UInt(5)(0)).select(UInt(1)(0), reg_write)  # rd为x0时不写入
         
-        # 新控制信号格式 (51位):
-        # [50:48] - div_op (3位除法操作码)
-        # [47:45] - mul_op (3位乘法操作码)
-        # [44:33] - 立即数低12位
-        # [32:28] - rd地址
-        # [27]    - load_unsigned (1位): 1=LBU/LHU, 0=LB/LH/LW
-        # [26:25] - load_type (2位): 00=LB/LBU, 01=LH/LHU, 10=LW
-        # [24:23] - store_type (2位): 00=SB, 01=SH, 10=SW
-        # [22]    - jumpr_op
-        # [21]    - jump_op
-        # [20:18] - branch_op
-        # [17:12] - 保留位
-        # [11:10] - alu_src
-        # [9]     - mem_to_reg
-        # [8]     - reg_write
-        # [7]     - mem_write
-        # [6]     - mem_read
-        # [5:0]   - alu_op
+        # 新控制信号格式 (48位):
+        # [47:45] - div_op (3位除法操作码)
+        # [44:42] - mul_op (3位乘法操作码)
+        # [41:30] - 立即数低12位
+        # [29:25] - rd地址
+        # [24]    - 保留位
+        # [23:22] - 存储类型: 00=SB, 01=SH, 10=SW
+        # [21]    - jumpr_op
+        # [20]    - jump_op
+        # [19:17] - branch_op
+        # [16:11] - 保留位
+        # [10:9]  - alu_src
+        # [8]     - mem_to_reg
+        # [7]     - reg_write
+        # [6]     - mem_write
+        # [5]     - mem_read
+        # [4:0]   - alu_op
         control_signals = concat(
-            div_op,           # [50:48] 除法操作码
-            mul_op,           # [47:45] 乘法操作码
-            immediate[0:11],   # [44:33] 立即数低12位
-            rd,               # [32:28] rd地址
-            load_unsigned,    # [27]    无符号加载标志: 1=LBU/LHU, 0=LB/LH/LW
-            load_type_bits,   # [26:25] 加载类型: 00=LB/LBU, 01=LH/LHU, 10=LW
-            store_type_bits,  # [24:23] 存储类型: 00=SB, 01=SH, 10=SW
-            jumpr_op,       # [22]    jumpr_op
-            jump_op,          # [21]    跳转指令标志
-            branch_op,        # [20:18] 分支操作类型
-            UInt(6)(0),       # [17:12] 保留位
-            alu_src,          # [11:10] ALU输入选择
-            mem_to_reg,       # [9]     内存到寄存器
-            reg_write,        # [8]     寄存器写
-            mem_write,        # [7]     内存写
-            mem_read,         # [6]     内存读
-            alu_op,           # [5:0]   ALU操作码
+            div_op,           # [47:45] 除法操作码
+            mul_op,           # [44:42] 乘法操作码
+            immediate[0:11],   # [41:30] 立即数低12位
+            rd,               # [29:25] rd地址
+            UInt(1)(0),       # [24]    保留位
+            store_type_bits,  # [23:22] 存储类型: 00=SB, 01=SH, 10=SW
+            jumpr_op,       # [21]    jumpr_op
+            jump_op,          # [20]    跳转指令标志
+            branch_op,        # [19:17] 分支操作类型
+            UInt(6)(0),       # [16:11] 保留位
+            alu_src,          # [10:9]  ALU输入选择
+            mem_to_reg,       # [8]     内存到寄存器
+            reg_write,        # [7]     寄存器写
+            mem_write,        # [6]     内存写
+            mem_read,         # [5]     内存读
+            alu_op,           # [4:0]   ALU操作码
         )
-
-        # Debug logging to verify control_signals construction
-        with Condition(is_l_type):
-            log("ID control_components v2: PC={}, rd={}, load_unsigned={}, load_type_bits={}, store_type_bits={}, immediate={}",
-                if_id_pc_in, rd, load_unsigned, load_type_bits, store_type_bits, immediate)
-            # Extract values FROM the control_signals to verify they're placed correctly
-            control_cast = control_signals.bitcast(UInt(51))
-            extracted_load_type = control_cast[25:26]  # [25:26] in Assassyn = bits [26:25] in traditional notation
-            extracted_load_unsigned = control_cast[27:27]  # Single bit
-            extracted_store_type = control_cast[23:24]  # [23:24] in Assassyn = bits [24:23] in traditional notation
-            extracted_rd = control_cast[28:32]  # [28:32] in Assassyn = bits [32:28]
-            extracted_imm = control_cast[33:44]  # [33:44] in Assassyn = bits [44:33]
-            log("ID control_signals v2: PC={}, control={:016x}, type={}/{}/{}, unsigned={}, rd={}/{}, imm={}/{}",
-                if_id_pc_in, control_cast,
-                load_type_bits, extracted_load_type, extracted_store_type,
-                extracted_load_unsigned, rd, extracted_rd, immediate, extracted_imm)
 
         # 乘法指令和除法指令也需要rs1和rs2
         need_rs1 = (is_i_type | is_r_type | is_s_type | is_b_type | is_l_type | is_jr_type | is_mul_inst | is_div_inst)
@@ -438,19 +389,13 @@ class DecodeStage(Module):
             id_ex_need_rs2[0] = if_id_valid[0].select(need_rs2, Bits(1)(0))
             # 传递预测信息到EX阶段
             id_ex_prediction_info[0] = if_id_valid[0].select(prediction_info_in, UInt(PREDICTION_INFO_LEN)(0))
-
-        # Always write pipeline registers when IF/ID is valid
-        with Condition(if_id_valid[0]):
-            id_ex_control[0] = control_signals
-            id_ex_valid[0] = UInt(1)(1)
-            id_ex_rs1_idx[0] = rs1
-            id_ex_rs2_idx[0] = rs2
-            id_ex_immediate[0] = immediate
-
-            # Debug: log pipeline register writes from decode stage
-            log("ID WRITE: PC={:08x}, immediate={}, rs1={}, rs2={}",
-                if_id_pc_in, immediate, rs1, rs2)
-
+            
+            # id_ex_control[0] = control_signals
+            # id_ex_valid[0] = UInt(1)(1)
+            # id_ex_rs1_idx[0] = rs1
+            # id_ex_rs2_idx[0] = rs2
+            # id_ex_immediate[0] = immediate
+            
             # log("ID: PC={}, Opcode={:07b}, RD={}, RS1={}, RS2={}, Immediate={}, Alu_op={}, Branch_op={}, Jump_op={}, Alu_src={}, Mem_read={}, Mem_write={}, Reg_write={}, Mem_to_reg={}, Control={:042b}",
                 # if_id_pc_in, opcode, rd, rs1, rs2, immediate, alu_op, branch_op, jump_op, alu_src, mem_read, mem_write, reg_write, mem_to_reg, control_signals)
         
@@ -468,14 +413,9 @@ class DecodeStage(Module):
         # 
         # 逻辑: id_ex_valid.select(if_id_valid.select(new_value, old_value), zero)
         out_control = id_ex_valid[0].select(if_id_valid[0].select(control_signals.bitcast(UInt(CONTROL_LEN)), id_ex_control[0]), UInt(CONTROL_LEN)(0))
-        out_mul_op = out_control[44:46]  # 乘法操作码 [46:44]
-
-        # Debug logging for control signals
-        with Condition(id_ex_valid[0] & if_id_valid[0]):
-            log("ID OUT: PC={}, control_load_type={}, control_load_unsigned={}",
-                if_id_pc_in, control_signals.bitcast(UInt(CONTROL_LEN))[24:25], control_signals.bitcast(UInt(CONTROL_LEN))[26:26])
+        out_mul_op = out_control[42:44]
         # log("DECODE OUT: if_id_valid={}, id_ex_valid={}, control_mul_op={}, id_ex_mul_op={}, out_mul_op={}",
-        #     if_id_valid[0], id_ex_valid[0], mul_op, id_ex_control[0][45:47], out_mul_op)
+        #     if_id_valid[0], id_ex_valid[0], mul_op, id_ex_control[0][42:44], out_mul_op)
         
         decode_signals = concat(
             id_ex_valid[0].select(if_id_valid[0].select(prediction_info_in, id_ex_prediction_info[0]), UInt(PREDICTION_INFO_LEN)(0)),  # 预测信息 (34位)
@@ -549,23 +489,18 @@ class ExecuteStage(Module):
         # 从寄存器文件读取基础值
         rs1_reg = reg_file[rs1_idx]
         rs2_reg = reg_file[rs2_idx]
-
-        # Debug: Log when sp (x2) is being read
-        with Condition((rs1_idx == UInt(5)(2)) | (rs2_idx == UInt(5)(2))):
-            log("REG READ: rs1_idx={}, rs1_data={}, rs2_idx={}, rs2_data={}",
-                rs1_idx, rs1_reg, rs2_idx, rs2_reg)
         
         # 解析 MEM 阶段控制信号（来自 EX/MEM 寄存器）用于前递
         mem_control = ex_mem_control[0]
         mem_reg_write = mem_control[7:7]  # reg_write 在第7位
-        mem_rd = mem_control[27:31]       # rd 在第27-31位
+        mem_rd = mem_control[25:29]       # rd 在第25-29位
         mem_result = ex_mem_result[0]     # MEM 阶段的 ALU 结果
-
+        
         # 解析 WB 阶段控制信号用于前递
         wb_control = mem_wb_control[0]
         wb_reg_write = wb_control[7:7]    # reg_write 在第7位
         wb_mem_to_reg = wb_control[8:8]   # mem_to_reg 在第8位
-        wb_rd = wb_control[27:31]         # rd 在第27-31位
+        wb_rd = wb_control[25:29]         # rd 在第25-29位
         wb_ex_result = mem_wb_ex_result[0]
         wb_mem_data = data_sram.dout[0]   # 从 SRAM 读取的数据
         
@@ -576,15 +511,7 @@ class ExecuteStage(Module):
         # 条件：reg_write=1 且 rs1_idx=rd 且 rd!=0（x0不能前递）
         rs1_forward_mem = (ex_mem_valid[0] & mem_reg_write & (rs1_idx == mem_rd) & (mem_rd != UInt(5)(0)))
         rs1_forward_wb = (mem_wb_valid[0] & wb_reg_write & (rs1_idx == wb_rd) & (wb_rd != UInt(5)(0)))
-
-        # Debug logging for forwarding (always log for now)
-        # with Condition((rs1_idx == UInt(5)(2)) | (rs2_idx == UInt(5)(2))):
-        #     log("FORWARDING: rs1_idx={}, rs1_forward_mem={}, rs1_forward_wb={}, wb_rd={}, wb_data={}, mem_rd={}, mem_result={}",
-        #         rs1_idx, rs1_forward_mem, rs1_forward_wb, wb_rd, wb_data, mem_rd, mem_result)
-        with Condition(pc_in == UInt(XLEN)(0x10)):
-            log("FORWARDING at PC {}: rs1_idx={}, rs1_reg={}, rs1_forward_mem={}, rs1_forward_wb={}, wb_rd={}, wb_data={}, rs1_data={}",
-                pc_in, rs1_idx, rs1_reg, rs1_forward_mem, rs1_forward_wb, wb_rd, wb_data, rs1_reg)
-
+        
         rs1_data = rs1_reg
         rs1_data = rs1_forward_wb.select(wb_data, rs1_data)
         rs1_data = rs1_forward_mem.select(mem_result, rs1_data)
@@ -601,27 +528,20 @@ class ExecuteStage(Module):
         pc_change = UInt(1)(0)
         target_pc = pc_in + UInt(XLEN)(4)  # 默认目标PC是PC+4
 
-        # 解析控制信号 (新格式51位，注意：concat有-1位偏移)
-        alu_op = control_in[0:4]  # ALU操作码 [4:0]
-        mem_read = control_in[5:5]  # 内存读
-        mem_write = control_in[6:6]  # 内存写
-        reg_write = control_in[7:7]  # 寄存器写
-        mem_to_reg = control_in[8:8]  # 内存到寄存器
-        alu_src = control_in[9:10]  # ALU输入选择 [10:9]
-        branch_op = control_in[17:19]  # 分支操作 [19:17]
+        # 解析控制信号 (新格式48位)
+        alu_op = control_in[0:4]
+        mem_read = control_in[5:5]
+        mem_write = control_in[6:6]
+        reg_write = control_in[7:7]
+        mem_to_reg = control_in[8:8]
+        alu_src = control_in[9:10]
+        branch_op = control_in[17:19]  # 修正：branch_op在[19:17]位
         jump_op = control_in[20:20]  # 跳转指令标志
         jumpr_op = control_in[21:21]  # 寄存器跳转指令标志
-        rd_addr = control_in[27:31]  # rd地址 [31:27]
-        immediate = control_in[32:43]  # 立即数 [43:32]
-        store_type = control_in[22:23]  # 存储类型 [23:22]
-        load_type = control_in[24:25]  # 加载类型 [25:24]
-        load_unsigned = control_in[26:26]  # 无符号加载 [26]
-        mul_op = control_in[44:46]  # 乘法操作码 [46:44]
-        div_op = control_in[47:49]  # 除法操作码 [49:47]
-
-        # Debug logging for load instructions in EX stage
-        with Condition(mem_read):
-            log("EX: PC={}, load_type={}, unsigned={}", pc_in, load_type, load_unsigned)
+        rd_addr = control_in[25:29]  # rd地址
+        immediate = control_in[22:31]  # 立即数
+        mul_op = control_in[42:44]  # 乘法操作码 [44:42]
+        div_op = control_in[45:47]  # 除法操作码 [47:45]
         
         # 判断是否为乘法指令
         is_mul_inst = (mul_op != UInt(3)(MUL_OP_NONE))
@@ -645,30 +565,10 @@ class ExecuteStage(Module):
         is_branch = (branch_op != UInt(3)(0b000))
         is_jump = (jump_op == UInt(1)(1))
         is_jumpr = (jumpr_op == UInt(1)(1))
-
-        # 对于LUI指令，ALU输入A应该是0而不是rs1_data
+        
         # 对于AUIPC指令，ALU输入A应该是PC而不是rs1_data
-        alu_a = UInt(XLEN)(0)  # Explicit initialization
         alu_a = rs1_data
-
-        # Detect LUI: not loading/writing memory, writing to register, not branch/jump, alu_src==1 (immediate), alu_op==0
-        is_lui_instruction = (mem_read == UInt(1)(0)) & (mem_write == UInt(1)(0)) & \
-                            (reg_write == UInt(1)(1)) & (branch_op == UInt(3)(0)) & \
-                            (jump_op == UInt(1)(0)) & (jumpr_op == UInt(1)(0)) & \
-                            (alu_src == UInt(2)(1)) & (alu_op == UInt(5)(0))
-
-        alu_a = is_lui_instruction.select(UInt(XLEN)(0), alu_a)
-
         alu_a = (alu_src == UInt(2)(2)).select(pc_in, alu_a)
-
-        # Debug: Log ALU inputs for addi sp,sp,-32
-        # with Condition(pc_in == UInt(XLEN)(0x10)):
-        #     log("ALU INPUTS at PC {}: alu_a={}, alu_b={}, rs1_data={}, immediate_in={}",
-        #         pc_in, alu_a, alu_b, rs1_data, immediate_in)
-
-        # Always log (we can filter later)
-        log("ALU DEBUG: PC={}, alu_a={}, alu_b={}, rs1_data={}, immediate_in={}",
-            pc_in, alu_a, alu_b, rs1_data, immediate_in)
 
         # 计算实际分支结果
         actual_taken = is_branch.select(self.branch_unit(branch_op, rs1_data, rs2_data), UInt(1)(0))
@@ -1063,8 +963,7 @@ class ExecuteStage(Module):
         
         # ==================== ALU结果选择 ====================
         # 普通ALU结果
-        # WORKAROUND: Use rs1_data directly instead of alu_a due to assignment bug
-        normal_alu_result = is_branch.select(UInt(XLEN)(0), (is_jump | is_jumpr).select(pc_in + UInt(XLEN)(4), self.alu_unit(alu_op, rs1_data, alu_b)))
+        normal_alu_result = is_branch.select(UInt(XLEN)(0), (is_jump | is_jumpr).select(pc_in + UInt(XLEN)(4), self.alu_unit(alu_op, alu_a, alu_b)))
         
         # 乘法或除法完成时使用对应的结果
         # 优先级：div_done > mul_done > normal_alu_result
@@ -1091,14 +990,8 @@ class ExecuteStage(Module):
         #     log("EX BRANCH: PC={:08x}, taken={}, target={:08x}, rs1={:08x}, rs2={:08x}",
         #         pc_in, actual_taken, actual_target_pc, rs1_data, rs2_data)
 
-        # Disable early termination - let simulation run normally
-        # with Condition(is_jump & (immediate_in == UInt(XLEN)(0))):
-        #     log("Finish Execution. The result is {}", reg_file[10])
-        #     finish()
-
-        # Alternative: Finish when PC reaches a certain address (for testing)
-        with Condition(pc_in == UInt(XLEN)(0x50)):
-            log("Finish Execution at PC={:08x}. The result is {}", pc_in, reg_file[10])
+        with Condition(is_jump & (immediate_in == UInt(XLEN)(0))):
+            log("Finish Execution. The result is {}", reg_file[10])
             finish()
         
         # 乘法指令需要等待乘法完成才能传递到MEM阶段
@@ -1136,9 +1029,9 @@ class ExecuteStage(Module):
             ex_mem_control[0] = pass_or_done.select(final_control, UInt(CONTROL_LEN)(0))
             ex_mem_result[0] = pass_or_done.select(alu_result, UInt(XLEN)(0))
             ex_mem_data[0] = pass_or_done.select(rs2_data, UInt(XLEN)(0))
-
-            log("EX: PC={}, ALU_OP={:05b}, Result={:08x}, Immediate={:08x}",
-                pc_in, alu_op, alu_result, immediate_in)
+            
+            # log("EX: PC={}, ALU_OP={:05b}, ALU_A={}, ALU_B={}, Result={:08x}, PC_Change={}, Target_PC={:08x}, Immediate={:08x}, ALU_SRC={}",
+            #     pc_in, alu_op, alu_a, alu_b, alu_result, pc_change, target_pc, immediate_in, alu_src)
         
         memory_stage.async_called()
 
@@ -1209,107 +1102,22 @@ class MemoryStage(Module):
         control_in = ex_mem_control[0]
         
         # 如果指令无效，直接返回，不更新MEM/WB寄存器
-        # 解析控制信号 (新格式51位，注意：concat有-1位偏移)
-        mem_read = control_in[5:5]  # 内存读
-        mem_write = control_in[6:6]  # 内存写
+        # 解析控制信号
+        mem_read = control_in[5:5]
+        mem_write = control_in[6:6]
         store_type = control_in[22:23]  # 存储类型: 00=SB, 01=SH, 10=SW
-        load_type = control_in[24:25]  # 加载类型: 00=LB/LBU, 01=LH/LHU, 10=LW
-        load_unsigned = control_in[26:26]  # 无符号加载: 1=LBU/LHU, 0=LB/LH/LW
         
         # 默认输出
         mem_data = UInt(XLEN)(0)
-
+        
         word_addr = addr_in >> UInt(XLEN)(2)
         write_data = data_in
-
-        # 计算字节偏移 (用于LB/LH/LBU/LHU)
-        # byte_offset is bits [0:1] of addr_in (lower 2 bits)
-        byte_offset = addr_in[0:1]
 
         with Condition(mem_wb_valid[0]):
             with Condition(mem_read | mem_write):
                 with Condition(ex_mem_valid[0]):
                     data_sram.build(we=mem_write, re=mem_read, addr=word_addr, wdata=write_data)
-                    mem_word_data = data_sram.dout[0]  # 读取完整的32位字
-
-                    # ==================== LB/LH/LW/LBU/LHU 实现 ====================
-                    # 根据load_type提取并扩展数据
-
-                    # Debug logging for load and store instructions
-                    with Condition(mem_read):
-                        log("MEM LOAD: PC={}, addr={:08x}, load_type={}, unsigned={}, mem_data={:08x}",
-                            pc_in, addr_in, load_type, load_unsigned, mem_word_data)
-
-                    with Condition(mem_write):
-                        log("MEM STORE: PC={}, addr={:08x}, store_type={}, wdata={:08x}",
-                            pc_in, addr_in, store_type, write_data)
-
-                    # 提取字节 (基于byte_offset)
-                    extracted_byte_0 = mem_word_data[0:7]   # Bits [7:0]
-                    extracted_byte_1 = mem_word_data[8:15]  # Bits [15:8]
-                    extracted_byte_2 = mem_word_data[16:23] # Bits [23:16]
-                    extracted_byte_3 = mem_word_data[24:31] # Bits [31:24]
-
-                    # 使用嵌套select选择正确的字节
-                    extracted_byte = (byte_offset == UInt(2)(0)).select(extracted_byte_0,
-                                        (byte_offset == UInt(2)(1)).select(extracted_byte_1,
-                                            (byte_offset == UInt(2)(2)).select(extracted_byte_2,
-                                                extracted_byte_3)))
-
-                    # 提取半字 (基于byte_offset[1])
-                    extracted_half_0 = mem_word_data[0:15]  # Bits [15:0]
-                    extracted_half_2 = mem_word_data[16:31] # Bits [31:16]
-
-                    # 使用嵌套select选择正确的半字
-                    # byte_offset[1:1] extracts bit 1 to determine if offset is 0/1 or 2/3
-                    extracted_half = (byte_offset[1:1] == UInt(1)(0)).select(extracted_half_0, extracted_half_2)
-
-                    # Debug logging after extraction
-                    with Condition(mem_read):
-                        log("MEM LOAD after extract: byte_offset={}, extracted_byte={:02x}, extracted_half={:04x}",
-                            byte_offset, extracted_byte, extracted_half)
-
-                    # 符号扩展字节 (LB)
-                    byte_sign_bit = extracted_byte[7:7]  # Extract MSB (bit 7)
-                    byte_as_uint32 = extracted_byte.bitcast(UInt(32))
-                    zero_extended_byte = (UInt(32)(0x000000FF) & byte_as_uint32).bitcast(UInt(32))
-                    sign_extended_byte = (byte_sign_bit == UInt(1)(0)).select(zero_extended_byte, (UInt(32)(0xFFFFFF00) | byte_as_uint32).bitcast(UInt(32)))
-                    lb_data = sign_extended_byte.bitcast(UInt(32))
-
-                    # 零扩展字节 (LBU)
-                    lbu_data = (UInt(32)(0x000000FF) & byte_as_uint32).bitcast(UInt(32))
-
-                    # 符号扩展半字 (LH)
-                    half_sign_bit = extracted_half[15:15]  # Extract MSB (bit 15)
-                    half_as_uint32 = extracted_half.bitcast(UInt(32))
-                    zero_extended_half = (UInt(32)(0x0000FFFF) & half_as_uint32).bitcast(UInt(32))
-                    sign_extended_half = (half_sign_bit == UInt(1)(0)).select(zero_extended_half, (UInt(32)(0xFFFF0000) | half_as_uint32).bitcast(UInt(32)))
-                    lh_data = sign_extended_half.bitcast(UInt(32))
-
-                    # 零扩展半字 (LHU)
-                    lhu_data = (UInt(32)(0x0000FFFF) & half_as_uint32).bitcast(UInt(32))
-
-                    # LW直接使用完整字
-                    lw_data = mem_word_data.bitcast(UInt(32))
-
-                    # 选择有符号/无符号 (字节加载)
-                    lb_lbu_data = (load_unsigned == UInt(1)(0)).select(lb_data, lbu_data)    # 有符号/无符号
-
-                    # 选择有符号/无符号 (半字加载)
-                    lh_lhu_data = (load_unsigned == UInt(1)(0)).select(lh_data, lhu_data)    # 有符号/无符号
-
-                    # 根据load_type选择最终数据
-                    final_load_data = (load_type == UInt(2)(0b00)).select(lb_lbu_data, lw_data)
-                    final_load_data = (load_type == UInt(2)(0b01)).select(lh_lhu_data, final_load_data)
-                    # load_type == 0b10 (LW) is already covered by the default lw_data
-
-                    # Debug logging for final load data
-                    with Condition(mem_read):
-                        log("MEM LOAD final: load_type={:02b}, unsigned={}, final_data={:08x}",
-                            load_type, load_unsigned, final_load_data)
-
-                    # 对于加载指令,使用处理后的数据; 对于存储指令,使用0
-                    mem_wb_mem_data[0] = (mem_read == UInt(1)(1)).select(final_load_data, UInt(XLEN)(0))
+                    mem_wb_mem_data[0] = data_sram.dout[0]          # 内存读取的数据
                 with Condition(~ex_mem_valid[0]):
                     mem_wb_mem_data[0] = UInt(XLEN)(0)
             mem_wb_control[0] = ex_mem_valid[0].select(control_in, UInt(CONTROL_LEN)(0))
@@ -1337,25 +1145,22 @@ class WriteBackStage(Module):
         ex_result_in = mem_wb_ex_result[0]
         control_in = mem_wb_control[0]
         
-            # 解析控制信号 (新格式51位，注意：concat有-1位偏移)
-        reg_write = control_in[7:7]  # 寄存器写
-        mem_to_reg = control_in[8:8]  # 内存到寄存器
-        wb_rd = control_in[27:31]  # rd地址 [31:27]
+            # 解析控制信号
+        reg_write = control_in[7:7]
+        mem_to_reg = control_in[8:8]
+        wb_rd = control_in[25:29]
             
         # 选择写回数据
         wb_data = mem_to_reg.select(mem_data_in, ex_result_in)
-
-        log("WB STAGE: ex_result_in={}, mem_to_reg={}, wb_data={}, wb_rd={}, reg_write={}, mem_wb_valid={}",
-            ex_result_in, mem_to_reg, wb_data, wb_rd, reg_write, mem_wb_valid[0])
-
+        
+        # log("WB STAGE: ex_result_in={}, mem_to_reg={}, wb_data={}, wb_rd={}, reg_write={}", 
+            # ex_result_in, mem_to_reg, wb_data, wb_rd, reg_write)
+            
         # 如果指令无效，直接返回
         with Condition(mem_wb_valid[0]):
             with Condition(reg_write):
                 reg_file[wb_rd] = wb_data
-                log("WB WRITE: reg[{}] = {}", wb_rd, wb_data)
-                # Verify the write by reading it back
-                verify_read = reg_file[wb_rd]
-                log("WB VERIFY: reg[{}] = {} after write", wb_rd, verify_read)
+                # log("WB WRITE: reg[{}] = {}", wb_rd, wb_data)
             # log("WB: Write_Data={}, RD={}, WE={}",
             #     wb_data, wb_rd, reg_write)
             # success = (wb_data == UInt(XLEN)(5050))
@@ -1374,9 +1179,9 @@ class HazardUnit(Downstream):
     def build(self, pc, stall, if_id_valid, if_id_instruction, if_id_prediction_info, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_prediction_info, ex_mem_valid, mem_wb_valid, btb, bht, btb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals, mul_in_progress, mul_cycle_counter, div_state, div_iter_count):
 
         # 计算新的信号长度 (增加3位乘法信号和3位除法信号)
-        # pc_change(1) + target_pc(32) + control(51) + prediction_result(103) + mul_signals(3) + div_signals(3) = 193
-        EXECUTE_SIGNALS_LEN = XLEN + 1 + CONTROL_LEN + 103 + 6  # 32 + 1 + 51 + 103 + 6 = 193
-        DECODE_SIGNALS_LEN = 2 + CONTROL_LEN + 5 + 5 + XLEN + PREDICTION_INFO_LEN  # need_rs1(1) + need_rs2(1) + control(51) + rs1(5) + rs2(5) + immediate(32) + prediction_info(34)
+        # pc_change(1) + target_pc(32) + control(48) + prediction_result(103) + mul_signals(3) + div_signals(3) = 190
+        EXECUTE_SIGNALS_LEN = XLEN + 1 + CONTROL_LEN + 103 + 6  # 32 + 1 + 48 + 103 + 6 = 190
+        DECODE_SIGNALS_LEN = 2 + CONTROL_LEN + 5 + 5 + XLEN + PREDICTION_INFO_LEN  # need_rs1(1) + need_rs2(1) + control(45) + rs1(5) + rs2(5) + immediate(32) + prediction_info(34)
 
         execute_signals = execute_signals.optional(Bits(EXECUTE_SIGNALS_LEN)(0))
         decode_signals = decode_signals.optional(Bits(DECODE_SIGNALS_LEN)(0))
@@ -1432,15 +1237,15 @@ class HazardUnit(Downstream):
 
         memory_control = execute_signals[XLEN + 1:XLEN + CONTROL_LEN].bitcast(UInt(CONTROL_LEN))
         memory_control = id_ex_valid[0].select(memory_control, UInt(CONTROL_LEN)(0))
-        rd_mem = memory_control[27:31]  # rd地址 [31:27]
-        reg_write_mem = memory_control[7:7]  # 寄存器写
-        mem_read_mem = memory_control[5:5]  # 内存读
-
+        rd_mem = memory_control[25:29]
+        reg_write_mem = memory_control[7:7]
+        mem_read_mem = memory_control[5:5]  # 解析 mem_read 信号用于检测 Load-Use 冒险
+        
         wb_control = memory_signals.bitcast(UInt(CONTROL_LEN))
         wb_control = ex_mem_valid[0].select(wb_control, UInt(CONTROL_LEN)(0))
-        rd_wb = wb_control[27:31]  # rd地址 [31:27]
-        reg_write_wb = wb_control[7:7]  # 寄存器写
-        mem_read_wb = wb_control[5:5]  # 内存读
+        rd_wb = wb_control[25:29]
+        reg_write_wb = wb_control[7:7]
+        mem_read_wb = wb_control[5:5]  # WB 阶段的 mem_read 信号
         
         # ==================== Load-Use 冒险检测 ====================
         # 只有 Load-Use 冒险需要暂停，其他数据冒险通过 bypass/forwarding 解决
@@ -1455,9 +1260,9 @@ class HazardUnit(Downstream):
         # ==================== 乘法冒险检测 ====================
         # 检测EX阶段是否有乘法指令
         ex_control = id_ex_control[0]
-        ex_rd = ex_control[27:31]  # rd地址 [31:27]
-        ex_mul_op = ex_control[44:46]  # 乘法操作码 [46:44]
-        ex_div_op = ex_control[47:49]  # 除法操作码 [49:47]
+        ex_rd = ex_control[25:29]
+        ex_mul_op = ex_control[42:44]
+        ex_div_op = ex_control[45:47]
         is_ex_mul = (ex_mul_op != UInt(3)(MUL_OP_NONE))
         is_ex_div = (ex_div_op != UInt(3)(DIV_OP_NONE))
         
@@ -1574,11 +1379,6 @@ class HazardUnit(Downstream):
             id_ex_rs1_idx[0] = need_flush.select(UInt(5)(0), rs1)
             id_ex_rs2_idx[0] = need_flush.select(UInt(5)(0), rs2)
             id_ex_prediction_info[0] = need_flush.select(UInt(PREDICTION_INFO_LEN)(0), prediction_info_id)
-
-        # Debug: log pipeline register writes
-        with Condition(id_ex_valid[0]):
-            log("PIPELINE: PC={:08x}, immediate={}, need_flush={}, if_id_valid={}",
-                if_id_pc_in, immediate, need_flush, if_id_valid[0])
 
 # ==================== 顶层CPU模块 ===================
 class Driver(Module):
@@ -1699,8 +1499,7 @@ def build_cpu(program_file="test_program.txt"):
         instruction_memory = RegArray(UInt(XLEN), 2048, initializer=test_program + [0]*(2048 - len(test_program)))
         
         # 创建寄存器文件
-        # NOTE: Don't use initializer as it seems to prevent writes from working!
-        reg_file = RegArray(UInt(XLEN), REG_COUNT)
+        reg_file = RegArray(UInt(XLEN), REG_COUNT, initializer=[0]*REG_COUNT)
 
         pc = RegArray(UInt(XLEN), 1, initializer=[0])
         stall = RegArray(UInt(1), 1, initializer=[0])
