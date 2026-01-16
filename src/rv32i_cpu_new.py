@@ -357,7 +357,11 @@ class ExecuteStage(Module):
         return taken
 
     @module.combinational
-    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change, reg_file, memory_stage):
+    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control,
+              id_ex_rob_id,  # Phase 2: ROB ID from Decode
+              ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change,
+              ex_mem_rob_id,  # Phase 2: ROB ID to Memory
+              reg_file, memory_stage):
         pc_in = id_ex_pc[0]
         rs1_idx = id_ex_rs1_idx[0]
         rs2_idx = id_ex_rs2_idx[0]
@@ -420,6 +424,7 @@ class ExecuteStage(Module):
             # ex_mem_valid[0] = UInt(1)(1)
             ex_mem_result[0] = id_ex_valid[0].select(alu_result, UInt(XLEN)(0))
             ex_mem_data[0] = id_ex_valid[0].select(rs2_data, UInt(XLEN)(0))
+            ex_mem_rob_id[0] = id_ex_valid[0].select(id_ex_rob_id[0], UInt(ROB_ID_BITS)(0))
             
             log("EX: PC={}, ALU_OP={:05b}, ALU_A={}, ALU_B={}, Result={:08x}, PC_Change={}, Target_PC={:08x}, Immediate={:08x}, ALU_SRC={}",
                 pc_in, alu_op, alu_a, alu_b, alu_result, pc_change, target_pc, immediate_in, alu_src)
@@ -441,7 +446,11 @@ class MemoryStage(Module):
         super().__init__(ports={})
     
     @module.combinational
-    def build(self, ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram):
+    def build(self, ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control,
+              ex_mem_rob_id,  # Phase 2: ROB ID from Execute
+              mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result,
+              mem_wb_rob_id,  # Phase 2: ROB ID to Writeback
+              writeback_stage, data_sram):
         pc_in = ex_mem_pc[0]
         addr_in = ex_mem_result[0]
         data_in = ex_mem_data[0]
@@ -469,9 +478,11 @@ class MemoryStage(Module):
             mem_wb_control[0] = ex_mem_valid[0].select(control_in, UInt(CONTROL_LEN)(0))
             # mem_wb_valid[0] = ex_mem_valid[0].select(UInt(1)(1), UInt(1)(0))
             mem_wb_ex_result[0] = ex_mem_valid[0].select(ex_mem_result[0], UInt(XLEN)(0))
+            # Phase 2: 传递 ROB ID
+            mem_wb_rob_id[0] = ex_mem_valid[0].select(ex_mem_rob_id[0], UInt(ROB_ID_BITS)(0))
             
-            log("MEM: PC={}, Addr={:08x}, Read={}, Write={}, data_in={}, data_out={}",
-                pc_in, addr_in, mem_read, mem_write, data_in, data_sram.dout[0])
+            log("MEM: PC={}, Addr={:08x}, Read={}, Write={}, data_in={}, data_out={}, ROB_ID={}",
+                pc_in, addr_in, mem_read, mem_write, data_in, data_sram.dout[0], ex_mem_rob_id[0])
 
 
         writeback_stage.async_called()
@@ -486,7 +497,11 @@ class WriteBackStage(Module):
         super().__init__(ports={})
     
     @module.combinational
-    def build(self, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file, data_sram):
+    def build(self, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control,
+              mem_wb_rob_id,  # Phase 2: ROB ID
+              rob_head, rob_valid, rob_ready, rob_value, rob_dest,  # Phase 2: ROB arrays
+              rat_valid, rat_tag,  # Phase 2: RAT for clearing on commit
+              reg_file, data_sram):
         mem_data_in = data_sram.dout[0]
         ex_result_in = mem_wb_ex_result[0]
         control_in = mem_wb_control[0]
@@ -499,12 +514,38 @@ class WriteBackStage(Module):
         # 选择写回数据
         wb_data = mem_to_reg.select(mem_data_in, ex_result_in)
             
-        # 如果指令无效，直接返回
-        with Condition(mem_wb_valid[0]):
-            with Condition(reg_write):
-                reg_file[wb_rd] = wb_data
-            log("WB: Write_Data={}, RD={}, WE={}",
-                wb_data, wb_rd, reg_write)
+        # ========== Phase 2: ROB Writeback ==========
+        current_rob_id = mem_wb_rob_id[0]
+        with Condition(mem_wb_valid[0] & reg_write):
+            # 更新 ROB：结果就绪
+            rob_ready[current_rob_id] = UInt(1)(1)
+            rob_value[current_rob_id] = wb_data
+            log("ROB Writeback: ID={}, Value={:08x}, Dest=x{}", current_rob_id, wb_data, wb_rd)
+        
+        # ========== Phase 2: ROB Commit（顺序提交）==========
+        head_id = rob_head[0]
+        head_valid = rob_valid[head_id]
+        head_ready = rob_ready[head_id]
+        head_dest = rob_dest[head_id]
+        head_value = rob_value[head_id]
+        
+        with Condition(head_valid & head_ready):
+            # 写入 reg_file（x0 不写）
+            with Condition(head_dest != UInt(5)(0)):
+                reg_file[head_dest] = head_value
+            
+            # 清除 RAT 映射（仅当 RAT 仍指向此 ROB ID）
+            with Condition(rat_valid[head_dest] & (rat_tag[head_dest] == head_id)):
+                rat_valid[head_dest] = UInt(1)(0)
+            
+            # 释放 ROB 条目
+            rob_valid[head_id] = UInt(1)(0)
+            rob_ready[head_id] = UInt(1)(0)
+            
+            # 前移 head
+            rob_head[0] = (head_id + UInt(ROB_ID_BITS)(1)) & UInt(ROB_ID_BITS)(ROB_SIZE - 1)
+            
+            log("ROB Commit: ID={}, Dest=x{}, Value={:08x}", head_id, head_dest, head_value)
 
         writeback_signals = control_in.bitcast(Bits(CONTROL_LEN))
         return writeback_signals
@@ -580,11 +621,17 @@ class HazardUnit(Downstream):
         pc[0] = pc_change.select(target_pc, data_hazard.select(pc[0], pc[0] + UInt(XLEN)(4)))
         with Condition(if_id_valid[0]):
             if_id_instruction[0] = pc_change.select(UInt(XLEN)(0x00000013), instruction)  # NOP指令
+        # 提取 allocated_rob_id（在 decode_signals 中 rob_full 之前 ROB_ID_BITS 位）
+        allocated_rob_id_offset = 2 + CONTROL_LEN + 5 + 5 + XLEN + 3*ROB_ID_BITS + 2*XLEN + 2 - ROB_ID_BITS
+        allocated_rob_id = decode_signals[allocated_rob_id_offset:allocated_rob_id_offset + ROB_ID_BITS - 1].bitcast(UInt(ROB_ID_BITS))
+        
         with Condition(id_ex_valid[0]):
             id_ex_control[0] = pc_change.select(nop_control, control_in)
             id_ex_immediate[0] = pc_change.select(UInt(XLEN)(0), immediate)
             id_ex_rs1_idx[0] = pc_change.select(UInt(5)(0), rs1)
             id_ex_rs2_idx[0] = pc_change.select(UInt(5)(0), rs2)
+            # Phase 2: 写入 ROB ID
+            id_ex_rob_id[0] = pc_change.select(UInt(ROB_ID_BITS)(0), allocated_rob_id)
 
         # ==================== Walk-back 恢复逻辑 ====================
         # 当 pc_change=1 且 ID 阶段有有效指令且该指令有写寄存器操作时
@@ -669,6 +716,7 @@ def build_cpu(program_file="test_program.txt"):
         id_ex_immediate = RegArray(UInt(XLEN), 1, initializer=[0])    # 立即数 (32位)
         id_ex_need_rs1 = RegArray(UInt(1), 1, initializer=[0])        # 是否需要rs1 (1位)
         id_ex_need_rs2 = RegArray(UInt(1), 1, initializer=[0])        # 是否需要rs2 (1位)
+        id_ex_rob_id = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])  # 分配的 ROB ID (Phase 2)
 
         # ==================== OoO 相关寄存器 ====================
         # RAT (Register Alias Table) - 32项
@@ -697,12 +745,14 @@ def build_cpu(program_file="test_program.txt"):
         ex_mem_pc_change = RegArray(UInt(1), 1, initializer=[0])       # PC变化标志 (1位)
         ex_mem_result = RegArray(UInt(XLEN), 1, initializer=[0])       # ALU结果 (32位)
         ex_mem_data = RegArray(UInt(XLEN), 1, initializer=[0])          # 数据 (32位)
+        ex_mem_rob_id = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])  # ROB ID (Phase 2)
 
         # MEM/WB阶段寄存器
         mem_wb_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (42位)
         mem_wb_valid = RegArray(UInt(1), 1, initializer=[1])            # 有效标志 (1位)
         mem_wb_mem_data = RegArray(UInt(XLEN), 1, initializer=[0])     # 内存数据 (32位)
         mem_wb_ex_result = RegArray(UInt(XLEN), 1, initializer=[0])     # EX阶段结果 (32位)
+        mem_wb_rob_id = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])  # ROB ID (Phase 2)
 
         # 创建指令内存
         test_program = init_memory(program_file)
@@ -724,15 +774,29 @@ def build_cpu(program_file="test_program.txt"):
         driver = Driver()
 
         # 按照流水线顺序构建模块
-        writeback_signals = writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file, data_sram)
-        memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram)
-        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change, reg_file, memory_stage)
+        writeback_signals = writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control,
+                                                   mem_wb_rob_id,  # Phase 2
+                                                   rob_head, rob_valid, rob_ready, rob_value, rob_dest,  # Phase 2
+                                                   rat_valid, rat_tag,  # Phase 2
+                                                   reg_file, data_sram)
+        memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control,
+                                                 ex_mem_rob_id,  # Phase 2
+                                                 mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result,
+                                                 mem_wb_rob_id,  # Phase 2
+                                                 writeback_stage, data_sram)
+        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control,
+                                                   id_ex_rob_id,  # Phase 2
+                                                   ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change,
+                                                   ex_mem_rob_id,  # Phase 2
+                                                   reg_file, memory_stage)
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2,
                                           rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
                                           rob_old_tag_valid, rob_old_tag,
                                           reg_file, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, instruction_memory, decode_stage)
-        hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid,
+        hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate,
+                          id_ex_rob_id,  # Phase 2
+                          ex_mem_valid, mem_wb_valid,
                           rob_valid, rob_ready, rob_tail, rob_dest, rob_old_tag_valid, rob_old_tag, rat_valid, rat_tag,
                           fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
         
