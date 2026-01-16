@@ -280,7 +280,7 @@ class ExecuteStage(Module):
         return taken
 
     @module.combinational
-    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage):
+    def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change, reg_file, memory_stage):
         pc_in = id_ex_pc[0]
         rs1_idx = id_ex_rs1_idx[0]
         rs2_idx = id_ex_rs2_idx[0]
@@ -350,9 +350,9 @@ class ExecuteStage(Module):
         memory_stage.async_called()
 
         execute_signals = concat(
-            id_ex_valid[0].select(control_in.bitcast(Bits(CONTROL_LEN)), Bits(CONTROL_LEN)(0)),
-            id_ex_valid[0].select(target_pc, UInt(XLEN)(0)),       # [31:1]  目标PC
-            id_ex_valid[0].select(pc_change, UInt(1)(0)),      # [0]     PC变化标志
+            ex_mem_valid[0].select(id_ex_valid[0].select(control_in.bitcast(Bits(CONTROL_LEN)), Bits(CONTROL_LEN)(0)), ex_mem_control[0].bitcast(Bits(CONTROL_LEN))),  # 控制信号
+            ex_mem_valid[0].select(id_ex_valid[0].select(target_pc, UInt(XLEN)(0)), ex_mem_target_pc[0]),       # 目标PC
+            ex_mem_valid[0].select(id_ex_valid[0].select(pc_change, UInt(1)(0)), ex_mem_pc_change[0]),          # PC变化标志
         )
 
         return execute_signals
@@ -399,7 +399,7 @@ class MemoryStage(Module):
 
         writeback_stage.async_called()
 
-        memory_signals = control_in.bitcast(Bits(CONTROL_LEN))
+        memory_signals = mem_wb_valid[0].select(ex_mem_valid[0].select(control_in.bitcast(Bits(CONTROL_LEN)), Bits(CONTROL_LEN)(0)), mem_wb_control[0].bitcast(Bits(CONTROL_LEN)))
         return memory_signals
 
 # ==================== WB阶段：写回 ===================
@@ -561,6 +561,8 @@ def build_cpu(program_file="test_program.txt"):
         ex_mem_pc = RegArray(UInt(XLEN), 1, initializer=[0])           # PC (32位)
         ex_mem_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (42位)
         ex_mem_valid = RegArray(UInt(1), 1, initializer=[1])            # 有效标志 (1位)
+        ex_mem_target_pc = RegArray(UInt(XLEN), 1, initializer=[0])    # 目标PC (32位)
+        ex_mem_pc_change = RegArray(UInt(1), 1, initializer=[0])       # PC变化标志 (1位)
         ex_mem_result = RegArray(UInt(XLEN), 1, initializer=[0])       # ALU结果 (32位)
         ex_mem_data = RegArray(UInt(XLEN), 1, initializer=[0])          # 数据 (32位)
 
@@ -592,7 +594,7 @@ def build_cpu(program_file="test_program.txt"):
         # 按照流水线顺序构建模块
         writeback_signals = writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file, data_sram)
         memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram)
-        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, reg_file, memory_stage)
+        execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change, reg_file, memory_stage)
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, reg_file, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, instruction_memory, decode_stage)
         hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
