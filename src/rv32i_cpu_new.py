@@ -55,6 +55,7 @@ class DecodeStage(Module):
     @module.combinational
     def build(self, if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, 
               rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
+              rob_old_tag_valid, rob_old_tag,
               reg_file, execute_stage):
         if_id_pc_in = if_id_pc[0]
         instruction = if_id_instruction[0]
@@ -263,8 +264,14 @@ class DecodeStage(Module):
         # ==================== RAT 更新逻辑 ====================
         # 当有写寄存器操作且目标不是x0且ROB未满时，更新RAT
         with Condition(if_id_valid[0] & reg_write & (rd != UInt(5)(0)) & ~rob_full):
+            # 保存旧的 RAT 映射到 ROB（用于 Walk-back 恢复）
+            rob_old_tag_valid[allocated_rob_id] = rat_valid[rd]
+            rob_old_tag[allocated_rob_id] = rat_tag[rd]
+            
+            # 更新 RAT
             rat_valid[rd] = UInt(1)(1)
             rat_tag[rd] = allocated_rob_id
+            
             # 同时在ROB中分配条目
             rob_valid[allocated_rob_id] = UInt(1)(1)
             rob_ready[allocated_rob_id] = UInt(1)(0)  # 结果未就绪
@@ -272,7 +279,7 @@ class DecodeStage(Module):
             rob_pc[allocated_rob_id] = if_id_pc_in
             # 递增 rob_tail (环形队列)
             rob_tail[0] = next_rob_tail
-            log("RAT Update: rd={}, rob_id={}, new_tail={}", rd, allocated_rob_id, next_rob_tail)
+            log("RAT Update: rd={}, rob_id={}, old_valid={}, old_tag={}", rd, allocated_rob_id, rat_valid[rd], rat_tag[rd])
         
         # rs1 = (~if_id_valid[0]).select(Bits(5)(0), rs1)
         # rs2 = (~if_id_valid[0]).select(Bits(5)(0), rs2)
@@ -507,7 +514,9 @@ class HazardUnit(Downstream):
         super().__init__()
 
     @downstream.combinational
-    def build(self, pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals):
+    def build(self, pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid, 
+              rob_valid, rob_ready, rob_tail, rob_dest, rob_old_tag_valid, rob_old_tag, rat_valid, rat_tag,
+              fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals):
 
         execute_signals = execute_signals.optional(Bits(XLEN + 1 + CONTROL_LEN)(0))
         decode_signals = decode_signals.optional(Bits(2 + CONTROL_LEN + 5 + 5 + XLEN + 3*ROB_ID_BITS + 2*XLEN + 2 + 1)(0))  # +1 for rob_full
@@ -546,6 +555,10 @@ class HazardUnit(Downstream):
         rob_full_offset = 2 + CONTROL_LEN + 5 + 5 + XLEN + 3*ROB_ID_BITS + 2*XLEN + 2
         rob_full = decode_signals[rob_full_offset:rob_full_offset].bitcast(UInt(1))
         
+        # 提取被 flush 指令分配的 ROB ID (用于 Walk-back)
+        flush_rob_id_offset = 2 + CONTROL_LEN + 5 + 5 + XLEN + 3*ROB_ID_BITS + 2*XLEN + 2 - ROB_ID_BITS
+        flush_rob_id = decode_signals[flush_rob_id_offset:flush_rob_id_offset + ROB_ID_BITS - 1].bitcast(UInt(ROB_ID_BITS))
+        
         # 当 ROB 满且当前指令需要写寄存器时，产生 Stall
         reg_write_decode = control_in[7:7]
         rob_stall = rob_full & reg_write_decode
@@ -572,6 +585,26 @@ class HazardUnit(Downstream):
             id_ex_immediate[0] = pc_change.select(UInt(XLEN)(0), immediate)
             id_ex_rs1_idx[0] = pc_change.select(UInt(5)(0), rs1)
             id_ex_rs2_idx[0] = pc_change.select(UInt(5)(0), rs2)
+
+        # ==================== Walk-back 恢复逻辑 ====================
+        # 当 pc_change=1 且 ID 阶段有有效指令且该指令有写寄存器操作时
+        # 需要撤销 DecodeStage 已执行的 ROB/RAT 分配
+        flush_dest = rob_dest[flush_rob_id]
+        with Condition(pc_change & reg_write_decode):
+            # 1. 恢复 RAT（仅当 RAT 仍指向被 flush 的 ROB）
+            with Condition(rat_valid[flush_dest] & (rat_tag[flush_dest] == flush_rob_id)):
+                # 恢复到旧映射
+                rat_valid[flush_dest] = rob_old_tag_valid[flush_rob_id]
+                rat_tag[flush_dest] = rob_old_tag[flush_rob_id]
+            
+            # 2. 清除 ROB 条目
+            rob_valid[flush_rob_id] = UInt(1)(0)
+            rob_ready[flush_rob_id] = UInt(1)(0)
+            
+            # 3. 回滚 rob_tail（撤销分配）
+            rob_tail[0] = flush_rob_id  # tail 回退到 flush 点
+            
+            log("Walk-back: flush ROB[{}], dest=x{}", flush_rob_id, flush_dest)
 
         log("RD_MEM={}, REG_WRITE_MEM={}, RD_WB={}, REG_WRITE_WB={}",
             rd_mem, reg_write_mem, rd_wb, reg_write_wb)
@@ -652,6 +685,9 @@ def build_cpu(program_file="test_program.txt"):
         rob_value = RegArray(UInt(XLEN), ROB_SIZE, initializer=[0]*ROB_SIZE)   # 执行结果
         rob_dest = RegArray(UInt(5), ROB_SIZE, initializer=[0]*ROB_SIZE)       # 目标寄存器号
         rob_pc = RegArray(UInt(XLEN), ROB_SIZE, initializer=[0]*ROB_SIZE)      # 指令PC
+        # Walk-back 恢复所需字段
+        rob_old_tag_valid = RegArray(UInt(1), ROB_SIZE, initializer=[0]*ROB_SIZE)  # 旧 RAT valid
+        rob_old_tag = RegArray(UInt(ROB_ID_BITS), ROB_SIZE, initializer=[0]*ROB_SIZE)  # 旧 RAT tag
 
         # EX/MEM阶段寄存器
         ex_mem_pc = RegArray(UInt(XLEN), 1, initializer=[0])           # PC (32位)
@@ -693,9 +729,12 @@ def build_cpu(program_file="test_program.txt"):
         execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change, reg_file, memory_stage)
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2,
                                           rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
+                                          rob_old_tag_valid, rob_old_tag,
                                           reg_file, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, instruction_memory, decode_stage)
-        hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
+        hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid,
+                          rob_valid, rob_ready, rob_tail, rob_dest, rob_old_tag_valid, rob_old_tag, rat_valid, rat_tag,
+                          fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
         
         # 构建Driver模块，处理PC更新
         driver.build(fetch_stage)
