@@ -15,6 +15,10 @@ XLEN = 32  # RISC-V XLEN
 REG_COUNT = 32  # 通用寄存器数量
 CONTROL_LEN = 42 # 控制信号长度
 
+# ==================== OoO 相关常量 ===================
+ROB_SIZE = 16       # ROB 大小
+ROB_ID_BITS = 4     # ROB ID 位宽 (log2(16) = 4)
+
 # ==================== IF阶段：指令获取 ===================
 class FetchStage(Module):
     """指令获取阶段(IF)"""
@@ -49,7 +53,9 @@ class DecodeStage(Module):
         super().__init__(ports={})
     
     @module.combinational
-    def build(self, if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, reg_file, execute_stage):
+    def build(self, if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, 
+              rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
+              reg_file, execute_stage):
         if_id_pc_in = if_id_pc[0]
         instruction = if_id_instruction[0]
 
@@ -179,6 +185,46 @@ class DecodeStage(Module):
 
         reg_write = (rd == UInt(5)(0)).select(UInt(1)(0), reg_write)  # rd为x0时不写入
         
+        # ==================== RAT 查询逻辑 ====================
+        # rs1 操作数查询
+        rs1_rat_valid = rat_valid[rs1]  # 是否有未提交指令写 rs1
+        rs1_rat_tag = rat_tag[rs1]      # 对应的 ROB ID
+        
+        rs1_from_rf = ~rs1_rat_valid                           # 从RF取值
+        rs1_from_rob = rs1_rat_valid & rob_ready[rs1_rat_tag]  # 从ROB取值
+        rs1_need_tag = rs1_rat_valid & ~rob_ready[rs1_rat_tag] # 需要等待
+        
+        rs1_value = rs1_from_rf.select(
+            reg_file[rs1],
+            rs1_from_rob.select(rob_value[rs1_rat_tag], UInt(XLEN)(0))
+        )
+        rs1_tag_out = rs1_need_tag.select(rs1_rat_tag, UInt(ROB_ID_BITS)(0))
+        rs1_ready = (rs1_from_rf | rs1_from_rob).bitcast(UInt(1))
+        
+        # rs2 操作数查询
+        rs2_rat_valid = rat_valid[rs2]
+        rs2_rat_tag = rat_tag[rs2]
+        
+        rs2_from_rf = ~rs2_rat_valid
+        rs2_from_rob = rs2_rat_valid & rob_ready[rs2_rat_tag]
+        rs2_need_tag = rs2_rat_valid & ~rob_ready[rs2_rat_tag]
+        
+        rs2_value = rs2_from_rf.select(
+            reg_file[rs2],
+            rs2_from_rob.select(rob_value[rs2_rat_tag], UInt(XLEN)(0))
+        )
+        rs2_tag_out = rs2_need_tag.select(rs2_rat_tag, UInt(ROB_ID_BITS)(0))
+        rs2_ready = (rs2_from_rf | rs2_from_rob).bitcast(UInt(1))
+        
+        # 分配 ROB ID (用于目标寄存器)
+        allocated_rob_id = rob_tail[0]
+        
+        # ==================== ROB 满检测 ====================
+        # 计算下一个 tail 位置
+        next_rob_tail = (rob_tail[0] + UInt(ROB_ID_BITS)(1)) & UInt(ROB_ID_BITS)(ROB_SIZE - 1)
+        # ROB 满的条件：下一个 tail 位置等于 head
+        rob_full = (next_rob_tail == rob_head[0])
+        
         control_signals = concat(
             immediate[0:11],   # [41:30] 立即数低12位
             rd,               # [29:25] rd地址
@@ -214,6 +260,20 @@ class DecodeStage(Module):
             log("ID: PC={}, Opcode={:07b}, RD={}, RS1={}, RS2={}, Immediate={}, Alu_op={}, Branch_op={}, Jump_op={}, Alu_src={}, Mem_read={}, Mem_write={}, Reg_write={}, Mem_to_reg={}, Control={:042b}",
                 if_id_pc_in, opcode, rd, rs1, rs2, immediate, alu_op, branch_op, jump_op, alu_src, mem_read, mem_write, reg_write, mem_to_reg, control_signals)
         
+        # ==================== RAT 更新逻辑 ====================
+        # 当有写寄存器操作且目标不是x0且ROB未满时，更新RAT
+        with Condition(if_id_valid[0] & reg_write & (rd != UInt(5)(0)) & ~rob_full):
+            rat_valid[rd] = UInt(1)(1)
+            rat_tag[rd] = allocated_rob_id
+            # 同时在ROB中分配条目
+            rob_valid[allocated_rob_id] = UInt(1)(1)
+            rob_ready[allocated_rob_id] = UInt(1)(0)  # 结果未就绪
+            rob_dest[allocated_rob_id] = rd.bitcast(UInt(5))
+            rob_pc[allocated_rob_id] = if_id_pc_in
+            # 递增 rob_tail (环形队列)
+            rob_tail[0] = next_rob_tail
+            log("RAT Update: rd={}, rob_id={}, new_tail={}", rd, allocated_rob_id, next_rob_tail)
+        
         # rs1 = (~if_id_valid[0]).select(Bits(5)(0), rs1)
         # rs2 = (~if_id_valid[0]).select(Bits(5)(0), rs2)
         # immediate = (~if_id_valid[0]).select(UInt(XLEN)(0), immediate)
@@ -222,6 +282,16 @@ class DecodeStage(Module):
         execute_stage.async_called()
 
         decode_signals = concat(
+            # OoO 相关信号
+            id_ex_valid[0].select(if_id_valid[0].select(rob_full, UInt(1)(0)), UInt(1)(0)),  # ROB满标志 (新增)
+            id_ex_valid[0].select(if_id_valid[0].select(allocated_rob_id, UInt(ROB_ID_BITS)(0)), UInt(ROB_ID_BITS)(0)),  # 分配的ROB ID
+            id_ex_valid[0].select(if_id_valid[0].select(rs2_value, UInt(XLEN)(0)), UInt(XLEN)(0)),      # rs2值
+            id_ex_valid[0].select(if_id_valid[0].select(rs2_tag_out, UInt(ROB_ID_BITS)(0)), UInt(ROB_ID_BITS)(0)),  # rs2 tag
+            id_ex_valid[0].select(if_id_valid[0].select(rs2_ready, UInt(1)(0)), UInt(1)(0)),            # rs2就绪
+            id_ex_valid[0].select(if_id_valid[0].select(rs1_value, UInt(XLEN)(0)), UInt(XLEN)(0)),      # rs1值
+            id_ex_valid[0].select(if_id_valid[0].select(rs1_tag_out, UInt(ROB_ID_BITS)(0)), UInt(ROB_ID_BITS)(0)),  # rs1 tag
+            id_ex_valid[0].select(if_id_valid[0].select(rs1_ready, UInt(1)(0)), UInt(1)(0)),            # rs1就绪
+            # 原有信号
             id_ex_valid[0].select(if_id_valid[0].select(need_rs2.bitcast(UInt(1)), UInt(1)(0)), id_ex_need_rs2[0]), 
             id_ex_valid[0].select(if_id_valid[0].select(need_rs1.bitcast(UInt(1)), UInt(1)(0)), id_ex_need_rs1[0]),
             id_ex_valid[0].select(if_id_valid[0].select(immediate, UInt(XLEN)(0)), id_ex_immediate[0]),
@@ -440,7 +510,7 @@ class HazardUnit(Downstream):
     def build(self, pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals):
 
         execute_signals = execute_signals.optional(Bits(XLEN + 1 + CONTROL_LEN)(0))
-        decode_signals = decode_signals.optional(Bits(2 + CONTROL_LEN + 5 + 5 + XLEN)(0))
+        decode_signals = decode_signals.optional(Bits(2 + CONTROL_LEN + 5 + 5 + XLEN + 3*ROB_ID_BITS + 2*XLEN + 2 + 1)(0))  # +1 for rob_full
         fetch_signals = fetch_signals.optional(Bits(XLEN)(0))
         memory_signals = memory_signals.optional(Bits(CONTROL_LEN)(0))
         writeback_signals = writeback_signals.optional(Bits(CONTROL_LEN)(0))
@@ -470,12 +540,22 @@ class HazardUnit(Downstream):
         needs_rs1 = decode_signals[CONTROL_LEN + 5 + 5 + XLEN:CONTROL_LEN + 5 + 5 + XLEN].bitcast(UInt(1))
         needs_rs2 = decode_signals[CONTROL_LEN + 5 + 5 + XLEN + 1:CONTROL_LEN + 5 + 5 + XLEN + 1].bitcast(UInt(1))
         
+        # 提取 rob_full 信号 (在 decode_signals 的最高位)
+        # decode_signals 结构: [control(42), rs1(5), rs2(5), imm(32), need_rs1(1), need_rs2(1), 
+        #                       rs1_ready(1), rs1_tag(4), rs1_value(32), rs2_ready(1), rs2_tag(4), rs2_value(32), rob_id(4), rob_full(1)]
+        rob_full_offset = 2 + CONTROL_LEN + 5 + 5 + XLEN + 3*ROB_ID_BITS + 2*XLEN + 2
+        rob_full = decode_signals[rob_full_offset:rob_full_offset].bitcast(UInt(1))
+        
+        # 当 ROB 满且当前指令需要写寄存器时，产生 Stall
+        reg_write_decode = control_in[7:7]
+        rob_stall = rob_full & reg_write_decode
+        
         data_hazard_ex = (reg_write_mem & ((needs_rs1 & (rs1 == rd_mem)) | (needs_rs2 & (rs2 == rd_mem)))).select(UInt(1)(1), data_hazard_ex)
 
         data_hazard_wb = (reg_write_wb & ((needs_rs1 & (rs1 == rd_wb)) | (needs_rs2 & (rs2 == rd_wb)))).select(UInt(1)(1), data_hazard_wb)
         
-        # 综合数据冒险信号
-        data_hazard = ((data_hazard_ex | data_hazard_wb) & ~pc_change)
+        # 综合数据冒险信号 (加入 rob_stall)
+        data_hazard = ((data_hazard_ex | data_hazard_wb | rob_stall) & ~pc_change)
         id_ex_valid[0] = (~data_hazard)
         if_id_valid[0] = (~data_hazard)
         ex_mem_valid[0] = UInt(1)(1)  # ID/EX和EX/MEM阶段始终有效
@@ -557,6 +637,22 @@ def build_cpu(program_file="test_program.txt"):
         id_ex_need_rs1 = RegArray(UInt(1), 1, initializer=[0])        # 是否需要rs1 (1位)
         id_ex_need_rs2 = RegArray(UInt(1), 1, initializer=[0])        # 是否需要rs2 (1位)
 
+        # ==================== OoO 相关寄存器 ====================
+        # RAT (Register Alias Table) - 32项
+        rat_valid = RegArray(UInt(1), REG_COUNT, initializer=[0]*REG_COUNT)
+        rat_tag = RegArray(UInt(ROB_ID_BITS), REG_COUNT, initializer=[0]*REG_COUNT)
+        
+        # ROB 指针
+        rob_head = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])  # 队头(Commit点)
+        rob_tail = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])  # 队尾(分配点)
+        
+        # ROB 数据数组 (每个ROB条目的字段)
+        rob_valid = RegArray(UInt(1), ROB_SIZE, initializer=[0]*ROB_SIZE)      # 条目是否有效
+        rob_ready = RegArray(UInt(1), ROB_SIZE, initializer=[0]*ROB_SIZE)      # 结果是否就绪
+        rob_value = RegArray(UInt(XLEN), ROB_SIZE, initializer=[0]*ROB_SIZE)   # 执行结果
+        rob_dest = RegArray(UInt(5), ROB_SIZE, initializer=[0]*ROB_SIZE)       # 目标寄存器号
+        rob_pc = RegArray(UInt(XLEN), ROB_SIZE, initializer=[0]*ROB_SIZE)      # 指令PC
+
         # EX/MEM阶段寄存器
         ex_mem_pc = RegArray(UInt(XLEN), 1, initializer=[0])           # PC (32位)
         ex_mem_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (42位)
@@ -595,7 +691,9 @@ def build_cpu(program_file="test_program.txt"):
         writeback_signals = writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control, reg_file, data_sram)
         memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control, mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, writeback_stage, data_sram)
         execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control, ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change, reg_file, memory_stage)
-        decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, reg_file, execute_stage)
+        decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2,
+                                          rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
+                                          reg_file, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, instruction_memory, decode_stage)
         hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid, fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
         
