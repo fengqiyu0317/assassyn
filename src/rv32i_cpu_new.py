@@ -609,7 +609,7 @@ class HazardUnit(Downstream):
         data_hazard_wb = (reg_write_wb & ((needs_rs1 & (rs1 == rd_wb)) | (needs_rs2 & (rs2 == rd_wb)))).select(UInt(1)(1), data_hazard_wb)
         
         # 综合数据冒险信号 (加入 rob_stall)
-        data_hazard = ((data_hazard_ex | data_hazard_wb | rob_stall) & ~pc_change)
+        data_hazard = ((data_hazard_ex | data_hazard_wb) & ~pc_change)
         id_ex_valid[0] = (~data_hazard)
         if_id_valid[0] = (~data_hazard)
         ex_mem_valid[0] = UInt(1)(1)  # ID/EX和EX/MEM阶段始终有效
@@ -618,20 +618,21 @@ class HazardUnit(Downstream):
         nop_control = UInt(CONTROL_LEN)(0) # NOP控制信号，全0表示无操作
 
         # 更新PC和IF/ID寄存器        
-        pc[0] = pc_change.select(target_pc, data_hazard.select(pc[0], pc[0] + UInt(XLEN)(4)))
-        with Condition(if_id_valid[0]):
-            if_id_instruction[0] = pc_change.select(UInt(XLEN)(0x00000013), instruction)  # NOP指令
+        pc[0] = pc_change.select(target_pc, (data_hazard | rob_stall).select(pc[0], pc[0] + UInt(XLEN)(4)))
+
+        if_id_instruction[0] = pc_change.select(UInt(XLEN)(0x00000013), (if_id_valid[0] & ~rob_stall).select(stall[0].select(UInt(XLEN)(0x00000013), instruction), if_id_instruction[0]))  # NOP指令
+        
         # 提取 allocated_rob_id（在 decode_signals 中 rob_full 之前 ROB_ID_BITS 位）
         allocated_rob_id_offset = 2 + CONTROL_LEN + 5 + 5 + XLEN + 3*ROB_ID_BITS + 2*XLEN + 2 - ROB_ID_BITS
         allocated_rob_id = decode_signals[allocated_rob_id_offset:allocated_rob_id_offset + ROB_ID_BITS - 1].bitcast(UInt(ROB_ID_BITS))
         
         with Condition(id_ex_valid[0]):
-            id_ex_control[0] = pc_change.select(nop_control, control_in)
-            id_ex_immediate[0] = pc_change.select(UInt(XLEN)(0), immediate)
-            id_ex_rs1_idx[0] = pc_change.select(UInt(5)(0), rs1)
-            id_ex_rs2_idx[0] = pc_change.select(UInt(5)(0), rs2)
+            id_ex_control[0] = (pc_change | rob_stall).select(nop_control, control_in)
+            id_ex_immediate[0] = (pc_change | rob_stall).select(UInt(XLEN)(0), immediate)
+            id_ex_rs1_idx[0] = (pc_change | rob_stall).select(UInt(5)(0), rs1)
+            id_ex_rs2_idx[0] = (pc_change | rob_stall).select(UInt(5)(0), rs2)
             # Phase 2: 写入 ROB ID
-            id_ex_rob_id[0] = pc_change.select(UInt(ROB_ID_BITS)(0), allocated_rob_id)
+            id_ex_rob_id[0] = (pc_change | rob_stall).select(UInt(ROB_ID_BITS)(0), allocated_rob_id)
 
         # ==================== Walk-back 恢复逻辑 ====================
         # 当 pc_change=1 且 ID 阶段有有效指令且该指令有写寄存器操作时
