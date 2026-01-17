@@ -336,7 +336,7 @@ class DecodeStage(Module):
             lsq_fu_valid, lsq_fu_lsq_id, lsq_fu_vj, lsq_fu_vk, lsq_fu_imm, lsq_fu_dest, lsq_fu_is_store, lsq_fu_control,
             execute_stage)
         
-        execute_stage.async_called()
+        dispatch_issue_stage.async_called()
 
         decode_signals = concat(
             # rs_full 信号
@@ -673,8 +673,9 @@ class MemoryStage(Module):
               mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result,
               mem_wb_rob_id,  # Phase 2: ROB ID to Writeback
               mem_wb_lsq_id,  # Phase 5: LSQ ID to Writeback
-              # Phase 5: LSQ 前递结果
-              forward_hit, forward_data, load_blocked,
+              # Phase 5: LSQ 相关参数 (用于前递检查)
+              lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
+              lsq_addr, lsq_data, lsq_rob_id,
               lsq_done,  # Phase 5: LSQ done 标记
               writeback_stage, data_sram):
         pc_in = ex_mem_pc[0]
@@ -693,6 +694,12 @@ class MemoryStage(Module):
         
         word_addr = addr_in >> UInt(XLEN)(2)
         write_data = data_in
+        
+        # Phase 5: LSQ Store-to-Load 前递检查
+        forward_hit, forward_data, load_blocked = lsq_forward_check(
+            lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
+            lsq_addr, lsq_data, lsq_rob_id,
+            lsq_id, addr_in, mem_read & ex_mem_valid[0])
 
         with Condition(mem_wb_valid[0]):
             with Condition(mem_read | mem_write):
@@ -958,60 +965,52 @@ class DispatchIssueStage(Module):
         return stall_condition, issue_valid
 
 
-# ==================== Phase 5: LSQ 前递单元 ===================
-class LSQUnit(Module):
-    """LSQ 前递与依赖检查单元"""
-    def __init__(self):
-        super().__init__(ports={})
+# ==================== Phase 5: LSQ 前递函数 ===================
+def lsq_forward_check(lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
+                      lsq_addr, lsq_data, lsq_rob_id,
+                      load_lsq_id, load_addr, load_valid):
+    """
+    检查 Load 是否可以执行：
+    1. 检查所有更早的 Store
+    2. 若存在未知地址的 Store，Load 阻塞
+    3. 若地址匹配且数据就绪，前递数据
+    """
     
-    @module.combinational
-    def build(self,
-              lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
-              lsq_addr, lsq_data, lsq_rob_id,
-              # 当前 Load 信息
-              load_lsq_id, load_addr, load_valid):
-        """
-        检查 Load 是否可以执行：
-        1. 检查所有更早的 Store
-        2. 若存在未知地址的 Store，Load 阻塞
-        3. 若地址匹配且数据就绪，前递数据
-        """
+    # 初始化
+    has_unknown_addr = UInt(1)(0)
+    forward_match = UInt(1)(0)
+    fwd_data = UInt(XLEN)(0)
+    load_rob = lsq_rob_id[load_lsq_id]
+    
+    # 遍历检查前序 Store
+    for i in range(LSQ_SIZE):
+        # 判断：这是一个比当前 Load 更早的有效 Store 吗？
+        # 使用 ROB ID 比较（更小的 ROB ID = 程序顺序更早）
+        is_earlier_store = lsq_valid[i] & lsq_is_store[i] & (lsq_rob_id[i] < load_rob)
         
-        # 初始化
-        has_unknown_addr = UInt(1)(0)
-        forward_match = UInt(1)(0)
-        fwd_data = UInt(XLEN)(0)
-        load_rob = lsq_rob_id[load_lsq_id]
+        # 检查地址是否未知
+        addr_unknown = is_earlier_store & ~lsq_addr_ready[i]
+        has_unknown_addr = has_unknown_addr | addr_unknown
         
-        # 遍历检查前序 Store
-        for i in range(LSQ_SIZE):
-            # 判断：这是一个比当前 Load 更早的有效 Store 吗？
-            # 使用 ROB ID 比较（更小的 ROB ID = 程序顺序更早）
-            is_earlier_store = lsq_valid[i] & lsq_is_store[i] & (lsq_rob_id[i] < load_rob)
-            
-            # 检查地址是否未知
-            addr_unknown = is_earlier_store & ~lsq_addr_ready[i]
-            has_unknown_addr = has_unknown_addr | addr_unknown
-            
-            # 检查地址匹配（仅当地址已知时）
-            addr_match = is_earlier_store & lsq_addr_ready[i] & (lsq_addr[i] == load_addr)
-            # 若匹配且数据就绪，记录前递
-            fwd_hit = addr_match & lsq_data_ready[i]
-            forward_match = fwd_hit.select(UInt(1)(1), forward_match)
-            fwd_data = fwd_hit.select(lsq_data[i], fwd_data)
-        
-        # 输出信号
-        # forward_hit: 可以前递且无未知地址阻塞
-        forward_hit = forward_match & ~has_unknown_addr & load_valid
-        # forward_data: 前递的数据
-        forward_data = fwd_data
-        # load_blocked: 有未知地址的前序 Store，必须等待
-        load_blocked = has_unknown_addr & load_valid
-        
-        log("LSQUnit: load_lsq={}, load_addr={:08x}, fwd_hit={}, fwd_data={:08x}, blocked={}",
-            load_lsq_id, load_addr, forward_hit, forward_data, load_blocked)
-        
-        return forward_hit, forward_data, load_blocked
+        # 检查地址匹配（仅当地址已知时）
+        addr_match = is_earlier_store & lsq_addr_ready[i] & (lsq_addr[i] == load_addr)
+        # 若匹配且数据就绪，记录前递
+        fwd_hit = addr_match & lsq_data_ready[i]
+        forward_match = fwd_hit.select(UInt(1)(1), forward_match)
+        fwd_data = fwd_hit.select(lsq_data[i], fwd_data)
+    
+    # 输出信号
+    # forward_hit: 可以前递且无未知地址阻塞
+    forward_hit = forward_match & ~has_unknown_addr & load_valid
+    # forward_data: 前递的数据
+    forward_data = fwd_data
+    # load_blocked: 有未知地址的前序 Store，必须等待
+    load_blocked = has_unknown_addr & load_valid
+    
+    log("LSQForward: load_lsq={}, load_addr={:08x}, fwd_hit={}, fwd_data={:08x}, blocked={}",
+        load_lsq_id, load_addr, forward_hit, forward_data, load_blocked)
+    
+    return forward_hit, forward_data, load_blocked
 
 
 # ==================== Phase 3: 唤醒单元 (多CDB版本) ===================
@@ -1545,7 +1544,6 @@ def build_cpu(program_file="test_program.txt"):
         hazard_unit = HazardUnit()
         wakeup_unit = WakeupUnit()  # Phase 3
         dispatch_issue_stage = DispatchIssueStage()  # Phase 3: 合并的分派发射阶段
-        lsq_unit = LSQUnit()  # Phase 5: LSQ forwarding unit
         fetch_stage = FetchStage()
         decode_stage = DecodeStage()
         execute_stage = ExecuteStage()
@@ -1567,11 +1565,6 @@ def build_cpu(program_file="test_program.txt"):
                                                    # Phase 5: LSQ for Store commit
                                                    lsq_valid, lsq_addr, lsq_data, lsq_head,
                                                    reg_file, data_sram)
-        # Phase 5: LSQ Store-to-Load 前递
-        forward_hit, forward_data, load_blocked = lsq_unit.build(
-            lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
-            lsq_addr, lsq_data, lsq_rob_id, lsq_head,
-            ex_mem_lsq_id, ex_mem_result, ex_mem_control)
         
         memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control,
                                                  ex_mem_rob_id,  # Phase 2
@@ -1579,7 +1572,9 @@ def build_cpu(program_file="test_program.txt"):
                                                  mem_wb_control, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result,
                                                  mem_wb_rob_id,  # Phase 2
                                                  mem_wb_lsq_id,  # Phase 5: LSQ ID to Writeback
-                                                 forward_hit, forward_data, load_blocked,  # Phase 5: LSQ forwarding
+                                                 # Phase 5: LSQ 参数 (用于前递检查)
+                                                 lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
+                                                 lsq_addr, lsq_data, lsq_rob_id,
                                                  lsq_done,  # Phase 5: LSQ done flag
                                                  writeback_stage, data_sram)
         execute_signals = execute_stage.build(id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control,
