@@ -28,6 +28,12 @@ FU_ALU    = 0b000   # ALU 运算
 FU_BRANCH = 0b001   # 分支计算
 FU_LOAD   = 0b010   # Load
 FU_STORE  = 0b011   # Store
+FU_MUL    = 0b100   # 乘法
+FU_DIV    = 0b101   # 除法
+
+# Phase 4: 多周期 FU 延迟
+MUL_LATENCY = 3     # 乘法 3 周期
+DIV_LATENCY = 10    # 除法 10 周期
 
 # ==================== IF阶段：指令获取 ===================
 class FetchStage(Module):
@@ -377,12 +383,47 @@ class ExecuteStage(Module):
             op, a, b, taken)
         
         return taken
+    
+    # Phase 4: MulDiv 单元 (组合逻辑部分，用于计算结果)
+    def muldiv_unit(self, op: Value, a: Value, b: Value):
+        """乘除计算单元 - 仅计算结果，多周期由状态机控制"""
+        result = UInt(XLEN)(0)
+        a_signed = a.bitcast(Int(XLEN))
+        b_signed = b.bitcast(Int(XLEN))
+        
+        # MUL: result = (a * b)[31:0]
+        mul_result = (a * b).bitcast(UInt(XLEN))
+        # MULH: result = (signed(a) * signed(b))[63:32]
+        mulh_result = ((a_signed * b_signed) >> Int(32)(32)).bitcast(UInt(XLEN))
+        # DIV: result = signed(a) / signed(b)
+        div_result = (b != UInt(XLEN)(0)).select(
+            (a_signed / b_signed).bitcast(UInt(XLEN)), 
+            UInt(XLEN)(0xFFFFFFFF)  # 除以 0 返回 -1
+        )
+        # REM: result = signed(a) % signed(b)
+        rem_result = (b != UInt(XLEN)(0)).select(
+            (a_signed % b_signed).bitcast(UInt(XLEN)),
+            a  # 除以 0 返回被除数
+        )
+        
+        # 根据 op 选择结果 (使用 alu_op 的低 3 位区分 M 扩展指令)
+        result = (op[0:2] == UInt(3)(0b000)).select(mul_result, result)   # MUL
+        result = (op[0:2] == UInt(3)(0b001)).select(mulh_result, result)  # MULH
+        result = (op[0:2] == UInt(3)(0b100)).select(div_result, result)   # DIV
+        result = (op[0:2] == UInt(3)(0b110)).select(rem_result, result)   # REM
+        
+        log("MULDIV: OP={:05b}, A={:08x}, B={:08x}, Result={:08x}", op, a, b, result)
+        
+        return result
 
     @module.combinational
     def build(self, id_ex_valid, id_ex_pc, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_control,
               id_ex_rob_id,  # Phase 2: ROB ID from Decode
               ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change,
               ex_mem_rob_id,  # Phase 2: ROB ID to Memory
+              # Phase 4: MulDiv 状态寄存器
+              md_busy, md_cnt, md_op, md_vj, md_vk, md_dest,
+              md_pending, md_pending_value, md_pending_dest,
               reg_file, memory_stage):
         pc_in = id_ex_pc[0]
         rs1_idx = id_ex_rs1_idx[0]
@@ -434,6 +475,51 @@ class ExecuteStage(Module):
         new_pc = (new_pc_temp ^ (new_pc_temp & UInt(XLEN)(1)))
         target_pc = is_jumpr.select(new_pc.bitcast(UInt(32)), target_pc)
         pc_change = (branch_result.bitcast(Bits(1)) | is_jump | is_jumpr).select(UInt(1)(1), pc_change)
+        
+        # ========== Phase 4: MulDiv FU 多周期状态机 ==========
+        # 检测是否为 MulDiv 指令 (使用 alu_op 的高位判断 M 扩展)
+        is_muldiv_op = (alu_op[3:4] == UInt(2)(0b01))  # M 扩展指令 alu_op = 0b01xxx
+        is_mul = is_muldiv_op & (alu_op[2:2] == UInt(1)(0))  # MUL/MULH
+        is_div = is_muldiv_op & (alu_op[2:2] == UInt(1)(1))  # DIV/REM
+        
+        # 启动新的 MulDiv 运算
+        with Condition(id_ex_valid[0] & is_muldiv_op & ~md_busy[0]):
+            md_busy[0] = UInt(1)(1)
+            md_op[0] = alu_op
+            md_vj[0] = rs1_data
+            md_vk[0] = alu_b
+            md_dest[0] = id_ex_rob_id[0]
+            # 设置延迟周期数
+            md_cnt[0] = is_mul.select(UInt(4)(MUL_LATENCY), UInt(4)(DIV_LATENCY))
+            log("MulDiv Start: op={:05b}, vj={:08x}, vk={:08x}, dest=ROB[{}], latency={}",
+                alu_op, rs1_data, alu_b, id_ex_rob_id[0], md_cnt[0])
+        
+        # 递减计数器
+        with Condition(md_busy[0] & (md_cnt[0] > UInt(4)(1))):
+            md_cnt[0] = md_cnt[0] - UInt(4)(1)
+        
+        # MulDiv 完成检测
+        md_done = md_busy[0] & (md_cnt[0] == UInt(4)(1))
+        md_result = self.muldiv_unit(md_op[0], md_vj[0], md_vk[0])
+        
+        with Condition(md_done):
+            md_busy[0] = UInt(1)(0)
+            log("MulDiv Done: dest=ROB[{}], result={:08x}", md_dest[0], md_result)
+        
+        # 处理 pending 的 MulDiv 结果 (上周期被抢占的)
+        with Condition(md_pending[0]):
+            md_pending[0] = UInt(1)(0)
+            log("MulDiv Pending Cleared: dest=ROB[{}], value={:08x}", md_pending_dest[0], md_pending_value[0])
+        
+        # 如果当前有 Branch 且 MulDiv 同时完成，MulDiv 进入 pending
+        with Condition(md_done & is_branch & branch_result.bitcast(UInt(1))):
+            md_pending[0] = UInt(1)(1)
+            md_pending_value[0] = md_result
+            md_pending_dest[0] = md_dest[0]
+        
+        # MulDiv 指令不写 ex_mem 流水线（结果直接通过 CDB 广播）
+        # 修正 alu_result：MulDiv 指令结果不经过普通 ALU 路径
+        alu_result = is_muldiv_op.select(UInt(XLEN)(0), alu_result)
 
         with Condition(is_jump & (immediate_in == UInt(XLEN)(0))):
             log("Finish Execution. The result is {}", reg_file[10])
@@ -542,10 +628,10 @@ class DispatchStage(Module):
         # 找空闲 RS (简单优先级编码)
         rs_free = UInt(RS_ID_BITS)(0)
         rs_found = UInt(1)(0)
+
         for i in range(RS_SIZE):
-            with Condition(~rs_busy[i] & ~rs_found):
-                rs_free = UInt(RS_ID_BITS)(i)
-                rs_found = UInt(1)(1)
+            rs_free = (~rs_busy[i] & ~rs_found).select(UInt(RS_ID_BITS)(i), rs_free)
+            rs_found = (~rs_busy[i] & ~rs_found).select(UInt(1)(1), rs_found)
         
         # RS 满检测
         rs_full = ~rs_found
@@ -588,18 +674,19 @@ class IssueStage(Module):
     @module.combinational
     def build(self, rs_busy, rs_op, rs_vj, rs_vk, rs_qj_valid, rs_qk_valid, 
               rs_dest, rs_imm, rs_func, rs_control,
-              issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control,
+              issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control, issue_ex_func,
+              md_busy,  # Phase 4: MulDiv 忙状态
               execute_stage):
         
         # 选择就绪的指令 (Qj_valid=0 且 Qk_valid=0 表示操作数都就绪)
         issue_idx = UInt(RS_ID_BITS)(0)
         issue_found = UInt(1)(0)
         
+        ready = Array(UInt(1), RS_SIZE)
         for i in range(RS_SIZE):
-            ready = rs_busy[i] & ~rs_qj_valid[i] & ~rs_qk_valid[i]
-            with Condition(ready & ~issue_found):
-                issue_idx = UInt(RS_ID_BITS)(i)
-                issue_found = UInt(1)(1)
+            ready[i] = rs_busy[i] & ~rs_qj_valid[i] & ~rs_qk_valid[i]
+            issue_idx = (ready[i] & ~issue_found).select(UInt(RS_ID_BITS)(i), issue_idx)
+            issue_found = (ready[i] & ~issue_found).select(UInt(1)(1), issue_found)
         
         # 发射选中的指令
         issue_valid = issue_found
@@ -613,12 +700,13 @@ class IssueStage(Module):
             issue_ex_dest[0] = rs_dest[issue_idx]
             issue_ex_imm[0] = rs_imm[issue_idx]
             issue_ex_control[0] = rs_control[issue_idx]
+            issue_ex_func[0] = rs_func[issue_idx]  # Phase 4: 传递 FU 类型
             
             # 释放 RS
             rs_busy[issue_idx] = UInt(1)(0)
             
-            log("Issue: RS[{}] -> EX, ROB[{}], op={:05b}, Vj={:08x}, Vk={:08x}",
-                issue_idx, rs_dest[issue_idx], rs_op[issue_idx], rs_vj[issue_idx], rs_vk[issue_idx])
+            log("Issue: RS[{}] -> EX, ROB[{}], op={:05b}, func={:03b}, Vj={:08x}, Vk={:08x}",
+                issue_idx, rs_dest[issue_idx], rs_op[issue_idx], rs_func[issue_idx], rs_vj[issue_idx], rs_vk[issue_idx])
         
         with Condition(~issue_valid):
             issue_ex_valid[0] = UInt(1)(0)
@@ -628,6 +716,7 @@ class IssueStage(Module):
             issue_ex_dest[0] = UInt(ROB_ID_BITS)(0)
             issue_ex_imm[0] = UInt(XLEN)(0)
             issue_ex_control[0] = UInt(CONTROL_LEN)(0)
+            issue_ex_func[0] = UInt(3)(0)  # Phase 4
         
         execute_stage.async_called()
         
@@ -843,6 +932,12 @@ class HazardUnit(Downstream):
                 with Condition(rs_busy[i] & ~rob_valid[rs_dest[i]]):
                     rs_busy[i] = UInt(1)(0)
                     log("Walk-back: RS[{}] cleared (ROB[{}] invalid)", UInt(RS_ID_BITS)(i), rs_dest[i])
+            
+            # Phase 4: Walk-back 时清理 MulDiv FU
+            # 如果 MulDiv 正在执行的指令对应的 ROB 被清除，则清理 MulDiv
+            with Condition(md_busy[0] & ~rob_valid[md_dest[0]]):
+                md_busy[0] = UInt(1)(0)
+                log("Walk-back: MulDiv cleared (ROB[{}] invalid)", md_dest[0])
 
         log("RD_MEM={}, REG_WRITE_MEM={}, RD_WB={}, REG_WRITE_WB={}",
             rd_mem, reg_write_mem, rd_wb, reg_write_wb)
@@ -955,6 +1050,19 @@ def build_cpu(program_file="test_program.txt"):
         issue_ex_dest = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
         issue_ex_imm = RegArray(UInt(XLEN), 1, initializer=[0])
         issue_ex_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])
+        issue_ex_func = RegArray(UInt(3), 1, initializer=[0])  # Phase 4: FU 类型
+
+        # ==================== Phase 4: MulDiv 状态寄存器 ====================
+        md_busy = RegArray(UInt(1), 1, initializer=[0])        # 是否忙
+        md_cnt = RegArray(UInt(4), 1, initializer=[0])         # 剩余周期计数
+        md_op = RegArray(UInt(5), 1, initializer=[0])          # 操作类型
+        md_vj = RegArray(UInt(XLEN), 1, initializer=[0])       # 源操作数1
+        md_vk = RegArray(UInt(XLEN), 1, initializer=[0])       # 源操作数2
+        md_dest = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])  # 目标 ROB ID
+        # MulDiv pending (CDB 冲突时使用)
+        md_pending = RegArray(UInt(1), 1, initializer=[0])
+        md_pending_value = RegArray(UInt(XLEN), 1, initializer=[0])
+        md_pending_dest = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
 
         # EX/MEM阶段寄存器
         ex_mem_pc = RegArray(UInt(XLEN), 1, initializer=[0])           # PC (32位)
@@ -1011,6 +1119,9 @@ def build_cpu(program_file="test_program.txt"):
                                                    id_ex_rob_id,  # Phase 2
                                                    ex_mem_pc, ex_mem_control, ex_mem_valid, ex_mem_result, ex_mem_data, ex_mem_target_pc, ex_mem_pc_change,
                                                    ex_mem_rob_id,  # Phase 2
+                                                   # Phase 4: MulDiv 状态寄存器
+                                                   md_busy, md_cnt, md_op, md_vj, md_vk, md_dest,
+                                                   md_pending, md_pending_value, md_pending_dest,
                                                    reg_file, memory_stage)
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2,
                                           rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
@@ -1021,7 +1132,8 @@ def build_cpu(program_file="test_program.txt"):
         # Phase 3: 发射阶段
         issue_stage.build(rs_busy, rs_op, rs_vj, rs_vk, rs_qj_valid, rs_qk_valid,
                           rs_dest, rs_imm, rs_func, rs_control,
-                          issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control,
+                          issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control, issue_ex_func,
+                          md_busy,  # Phase 4
                           execute_stage)
         
         # Phase 3: 唤醒单元
@@ -1033,6 +1145,7 @@ def build_cpu(program_file="test_program.txt"):
                           ex_mem_valid, mem_wb_valid,
                           rob_valid, rob_ready, rob_tail, rob_dest, rob_old_tag_valid, rob_old_tag, rat_valid, rat_tag,
                           rs_busy, rs_dest,  # Phase 3
+                          md_busy, md_dest,  # Phase 4
                           fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
         
         # 构建Driver模块，处理PC更新
