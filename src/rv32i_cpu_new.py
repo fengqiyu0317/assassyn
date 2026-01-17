@@ -76,7 +76,16 @@ class DecodeStage(Module):
     def build(self, if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2, 
               rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
               rob_old_tag_valid, rob_old_tag,
-              reg_file, execute_stage):
+              rs_busy, rs_op, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid, rs_dest_arr, rs_imm, rs_func, rs_control, rs_lsq_id, rs_pc,
+              lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready, lsq_addr, lsq_data, lsq_rob_id, lsq_done, lsq_head, lsq_tail,
+              rob_is_store, rob_lsq_id,
+              issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control, issue_ex_func, issue_ex_lsq_id,
+              md_busy,
+              # 多 FU 并行: 各 FU 独立寄存器
+              alu_fu_valid, alu_fu_op, alu_fu_vj, alu_fu_vk, alu_fu_dest, alu_fu_imm, alu_fu_control,
+              branch_fu_valid, branch_fu_vj, branch_fu_vk, branch_fu_dest, branch_fu_imm, branch_fu_control, branch_fu_pc,
+              lsq_fu_valid, lsq_fu_lsq_id, lsq_fu_vj, lsq_fu_vk, lsq_fu_imm, lsq_fu_dest, lsq_fu_is_store, lsq_fu_control,
+              reg_file, dispatch_issue_stage, execute_stage):
         if_id_pc_in = if_id_pc[0]
         instruction = if_id_instruction[0]
 
@@ -308,19 +317,24 @@ class DecodeStage(Module):
 
         # Phase 3: 调用 Dispatch 阶段将指令放入 RS
         dispatch_valid = if_id_valid[0] & id_ex_valid[0] & ~rob_full
-        rs_full = dispatch_stage.build(
+        rs_full, issue_valid = dispatch_issue_stage.build(
             dispatch_valid, control_signals.bitcast(UInt(CONTROL_LEN)), immediate, allocated_rob_id, if_id_pc_in,
             rs1_value, rs1_tag_out, rs1_ready,
             rs2_value, rs2_tag_out, rs2_ready,
             rs_busy, rs_op, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid,
-            rs_dest_arr, rs_imm, rs_func, rs_control, rs_lsq_id,  # Phase 5: 新增 rs_lsq_id
-            # Phase 5: LSQ 相关寄存器
+            rs_dest_arr, rs_imm, rs_func, rs_control, rs_lsq_id, rs_pc,
             lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
             lsq_addr, lsq_data, lsq_rob_id, lsq_done,
             lsq_head, lsq_tail,
-            # Phase 5: ROB Store 信息
             rob_is_store, rob_lsq_id,
-            issue_stage)
+            issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control, issue_ex_func,
+            issue_ex_lsq_id,
+            md_busy,
+            # 多 FU 并行: 各 FU 独立寄存器
+            alu_fu_valid, alu_fu_op, alu_fu_vj, alu_fu_vk, alu_fu_dest, alu_fu_imm, alu_fu_control,
+            branch_fu_valid, branch_fu_vj, branch_fu_vk, branch_fu_dest, branch_fu_imm, branch_fu_control, branch_fu_pc,
+            lsq_fu_valid, lsq_fu_lsq_id, lsq_fu_vj, lsq_fu_vk, lsq_fu_imm, lsq_fu_dest, lsq_fu_is_store, lsq_fu_control,
+            execute_stage)
         
         execute_stage.async_called()
 
@@ -437,6 +451,15 @@ class ExecuteStage(Module):
               md_pending, md_pending_value, md_pending_dest,
               # Phase 5: LSQ 相关
               issue_ex_lsq_id, lsq_addr, lsq_addr_ready, lsq_data, lsq_data_ready,
+              # 多 FU 并行: 各 FU 输入寄存器
+              alu_fu_valid, alu_fu_op, alu_fu_vj, alu_fu_vk, alu_fu_dest, alu_fu_imm, alu_fu_control,
+              branch_fu_valid, branch_fu_vj, branch_fu_vk, branch_fu_dest, branch_fu_imm, branch_fu_control, branch_fu_pc,
+              lsq_fu_valid, lsq_fu_lsq_id, lsq_fu_vj, lsq_fu_vk, lsq_fu_imm, lsq_fu_dest, lsq_fu_is_store, lsq_fu_control,
+              # 多 FU 并行: 4条独立CDB
+              cdb_alu_valid, cdb_alu_tag, cdb_alu_value,
+              cdb_branch_valid, cdb_branch_tag, cdb_branch_value,
+              cdb_md_valid, cdb_md_tag, cdb_md_value,
+              cdb_lsq_valid, cdb_lsq_tag, cdb_lsq_value,
               reg_file, memory_stage):
         pc_in = id_ex_pc[0]
         rs1_idx = id_ex_rs1_idx[0]
@@ -567,6 +590,66 @@ class ExecuteStage(Module):
             log("EX: PC={}, ALU_OP={:05b}, ALU_A={}, ALU_B={}, Result={:08x}, PC_Change={}, Target_PC={:08x}, Immediate={:08x}, ALU_SRC={}",
                 pc_in, alu_op, alu_a, alu_b, alu_result, pc_change, target_pc, immediate_in, alu_src)
         
+        # ========== 多 FU 并行执行 + CDB 广播 ==========
+        # ALU FU: 单周期执行，立即广播到 CDB_ALU
+        with Condition(alu_fu_valid[0]):
+            alu_fu_result = self.alu_unit(alu_fu_op[0], alu_fu_vj[0], alu_fu_vk[0])
+            cdb_alu_valid[0] = UInt(1)(1)
+            cdb_alu_tag[0] = alu_fu_dest[0]
+            cdb_alu_value[0] = alu_fu_result
+            alu_fu_valid[0] = UInt(1)(0)  # 清除 FU 占用
+            log("CDB_ALU: tag=ROB[{}], value={:08x}", alu_fu_dest[0], alu_fu_result)
+        with Condition(~alu_fu_valid[0]):
+            cdb_alu_valid[0] = UInt(1)(0)
+        
+        # Branch FU: 单周期执行，广播分支结果到 CDB_Branch
+        # 注意: 分支结果也需要标记 ROB ready (即使 rd=x0)
+        with Condition(branch_fu_valid[0]):
+            branch_fu_control_in = branch_fu_control[0]
+            branch_fu_branch_op = branch_fu_control_in[17:19]
+            branch_taken = self.branch_unit(branch_fu_branch_op, branch_fu_vj[0], branch_fu_vk[0])
+            # 分支指令返回的"值"用于指示跳转目标 (仅供 ROB 记录)
+            branch_fu_target = branch_fu_pc[0] + branch_fu_imm[0]
+            branch_fu_value = branch_taken.select(branch_fu_target, branch_fu_pc[0] + UInt(XLEN)(4))
+            cdb_branch_valid[0] = UInt(1)(1)
+            cdb_branch_tag[0] = branch_fu_dest[0]
+            cdb_branch_value[0] = branch_fu_value
+            branch_fu_valid[0] = UInt(1)(0)  # 清除 FU 占用
+            log("CDB_Branch: tag=ROB[{}], taken={}, target={:08x}", branch_fu_dest[0], branch_taken, branch_fu_target)
+        with Condition(~branch_fu_valid[0]):
+            cdb_branch_valid[0] = UInt(1)(0)
+        
+        # MulDiv FU: 多周期执行，完成时广播到 CDB_MD
+        with Condition(md_done):
+            cdb_md_valid[0] = UInt(1)(1)
+            cdb_md_tag[0] = md_dest[0]
+            cdb_md_value[0] = md_result
+            log("CDB_MD: tag=ROB[{}], value={:08x}", md_dest[0], md_result)
+        with Condition(~md_done):
+            cdb_md_valid[0] = UInt(1)(0)
+        
+        # LSQ FU: 执行地址计算并更新 LSQ
+        with Condition(lsq_fu_valid[0]):
+            lsq_fu_addr = lsq_fu_vj[0] + lsq_fu_imm[0]  # 地址 = base + offset
+            lsq_fu_id = lsq_fu_lsq_id[0]
+            lsq_addr[lsq_fu_id] = lsq_fu_addr
+            lsq_addr_ready[lsq_fu_id] = UInt(1)(1)
+            log("LSQ_FU: LSQ[{}] addr={:08x} computed", lsq_fu_id, lsq_fu_addr)
+            
+            with Condition(lsq_fu_is_store[0]):
+                # Store: 写入 data
+                lsq_data[lsq_fu_id] = lsq_fu_vk[0]
+                lsq_data_ready[lsq_fu_id] = UInt(1)(1)
+                log("LSQ_FU: Store LSQ[{}] data={:08x} ready", lsq_fu_id, lsq_fu_vk[0])
+            
+            # LSQ 结果通过 CDB_LSQ 广播 (仅 Load 需要，Store 由 Commit 处理)
+            # 注意: Load 结果需要等待内存返回，这里先清除 FU 有效位
+            lsq_fu_valid[0] = UInt(1)(0)
+        
+        # CDB_LSQ: Load 结果广播 (由 MemoryStage 或 LSQ 前递设置)
+        # 这里暂时保持空，Load 结果在 MemoryStage 完成后通过其他路径广播
+        # TODO: 完整实现需要 Load 完成后的 CDB 广播逻辑
+
         memory_stage.async_called()
 
         execute_signals = concat(
@@ -649,8 +732,9 @@ class MemoryStage(Module):
         return memory_signals
 
 # ==================== Phase 3: 分派阶段 ===================
-class DispatchStage(Module):
-    """指令分派阶段 - 将解码后的指令放入 Reservation Station"""
+# ==================== Phase 3: 分派发射阶段 (合并) ===================
+class DispatchIssueStage(Module):
+    """指令分派与发射阶段 - 将解码后的指令放入 RS，并选择就绪指令发射"""
     def __init__(self):
         super().__init__(ports={})
     
@@ -659,15 +743,24 @@ class DispatchStage(Module):
               rs1_value, rs1_tag, rs1_ready,
               rs2_value, rs2_tag, rs2_ready,
               rs_busy, rs_op, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid, 
-              rs_dest, rs_imm, rs_func, rs_control, rs_lsq_id,  # Phase 5: 新增 rs_lsq_id
+              rs_dest, rs_imm, rs_func, rs_control, rs_lsq_id, rs_pc,  # Phase 5: rs_lsq_id, 多FU: rs_pc
               # Phase 5: LSQ 相关参数
               lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
               lsq_addr, lsq_data, lsq_rob_id, lsq_done,
               lsq_head, lsq_tail,
               # Phase 5: ROB Store 信息
               rob_is_store, rob_lsq_id,
-              issue_stage):
+              # Issue 阶段输出寄存器 (MulDiv 兼容)
+              issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control, issue_ex_func,
+              issue_ex_lsq_id,  # Phase 5: issue_ex_lsq_id
+              md_busy,  # Phase 4: MulDiv 忙状态
+              # 多 FU 并行: 各 FU 独立寄存器
+              alu_fu_valid, alu_fu_op, alu_fu_vj, alu_fu_vk, alu_fu_dest, alu_fu_imm, alu_fu_control,
+              branch_fu_valid, branch_fu_vj, branch_fu_vk, branch_fu_dest, branch_fu_imm, branch_fu_control, branch_fu_pc,
+              lsq_fu_valid, lsq_fu_lsq_id, lsq_fu_vj, lsq_fu_vk, lsq_fu_imm, lsq_fu_dest, lsq_fu_is_store, lsq_fu_control,
+              execute_stage):
         
+        # ==================== Part 1: Dispatch 逻辑 ====================
         # 解析控制信号
         alu_op = dispatch_control[0:4]
         mem_read = dispatch_control[5:5]
@@ -712,6 +805,7 @@ class DispatchStage(Module):
             rs_imm[rs_free] = dispatch_immediate
             rs_func[rs_free] = fu_type
             rs_control[rs_free] = dispatch_control
+            rs_pc[rs_free] = dispatch_pc  # 多FU并行: 保存PC供Branch使用
             
             # 源操作数1
             rs_vj[rs_free] = rs1_ready.select(rs1_value, UInt(XLEN)(0))
@@ -745,58 +839,109 @@ class DispatchStage(Module):
             rob_lsq_id[dispatch_rob_id] = lsq_id
             log("Dispatch: LSQ[{}] allocated, is_store={}, ROB[{}]", lsq_id, is_store, dispatch_rob_id)
         
-        issue_stage.async_called()
+        # ==================== Part 2: Multi-FU Issue 逻辑 ====================
+        # 为每种 FU 类型独立选择一条就绪指令
         
-        # 返回 stall 信号给 HazardUnit 用于 Stall
-        return stall_condition
-
-
-# ==================== Phase 3: 发射阶段 ===================
-class IssueStage(Module):
-    """发射阶段 - 选择操作数就绪的指令送往执行单元"""
-    def __init__(self):
-        super().__init__(ports={})
-    
-    @module.combinational
-    def build(self, rs_busy, rs_op, rs_vj, rs_vk, rs_qj_valid, rs_qk_valid, 
-              rs_dest, rs_imm, rs_func, rs_control, rs_lsq_id,  # Phase 5: 新增 rs_lsq_id
-              issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control, issue_ex_func,
-              issue_ex_lsq_id,  # Phase 5: 新增 issue_ex_lsq_id
-              md_busy,  # Phase 4: MulDiv 忙状态
-              execute_stage):
-        
-        # 选择就绪的指令 (Qj_valid=0 且 Qk_valid=0 表示操作数都就绪)
-        issue_idx = UInt(RS_ID_BITS)(0)
-        issue_found = UInt(1)(0)
-        
-        ready = Array(UInt(1), RS_SIZE)
+        # --- ALU FU Issue ---
+        alu_issue_idx = UInt(RS_ID_BITS)(0)
+        alu_issue_found = UInt(1)(0)
         for i in range(RS_SIZE):
-            ready[i] = rs_busy[i] & ~rs_qj_valid[i] & ~rs_qk_valid[i]
-            issue_idx = (ready[i] & ~issue_found).select(UInt(RS_ID_BITS)(i), issue_idx)
-            issue_found = (ready[i] & ~issue_found).select(UInt(1)(1), issue_found)
+            is_alu = (rs_func[i] == UInt(3)(FU_ALU))
+            ready_alu = rs_busy[i] & ~rs_qj_valid[i] & ~rs_qk_valid[i] & is_alu
+            alu_issue_idx = (ready_alu & ~alu_issue_found).select(UInt(RS_ID_BITS)(i), alu_issue_idx)
+            alu_issue_found = (ready_alu & ~alu_issue_found).select(UInt(1)(1), alu_issue_found)
         
-        # 发射选中的指令
-        issue_valid = issue_found
+        with Condition(alu_issue_found):
+            alu_fu_valid[0] = UInt(1)(1)
+            alu_fu_op[0] = rs_op[alu_issue_idx]
+            alu_fu_vj[0] = rs_vj[alu_issue_idx]
+            alu_fu_vk[0] = rs_vk[alu_issue_idx]
+            alu_fu_dest[0] = rs_dest[alu_issue_idx]
+            alu_fu_imm[0] = rs_imm[alu_issue_idx]
+            alu_fu_control[0] = rs_control[alu_issue_idx]
+            rs_busy[alu_issue_idx] = UInt(1)(0)
+            log("Issue ALU: RS[{}] -> ALU_FU, ROB[{}], op={:05b}", alu_issue_idx, rs_dest[alu_issue_idx], rs_op[alu_issue_idx])
         
-        with Condition(issue_valid):
-            # 写入 Issue/EX 流水线寄存器
+        with Condition(~alu_issue_found):
+            alu_fu_valid[0] = UInt(1)(0)
+        
+        # --- Branch FU Issue ---
+        branch_issue_idx = UInt(RS_ID_BITS)(0)
+        branch_issue_found = UInt(1)(0)
+        for i in range(RS_SIZE):
+            is_branch = (rs_func[i] == UInt(3)(FU_BRANCH))
+            ready_branch = rs_busy[i] & ~rs_qj_valid[i] & ~rs_qk_valid[i] & is_branch
+            branch_issue_idx = (ready_branch & ~branch_issue_found).select(UInt(RS_ID_BITS)(i), branch_issue_idx)
+            branch_issue_found = (ready_branch & ~branch_issue_found).select(UInt(1)(1), branch_issue_found)
+        
+        with Condition(branch_issue_found):
+            branch_fu_valid[0] = UInt(1)(1)
+            branch_fu_vj[0] = rs_vj[branch_issue_idx]
+            branch_fu_vk[0] = rs_vk[branch_issue_idx]
+            branch_fu_dest[0] = rs_dest[branch_issue_idx]
+            branch_fu_imm[0] = rs_imm[branch_issue_idx]
+            branch_fu_control[0] = rs_control[branch_issue_idx]
+            branch_fu_pc[0] = rs_pc[branch_issue_idx]  # 多FU并行: 传递PC
+            rs_busy[branch_issue_idx] = UInt(1)(0)
+            log("Issue Branch: RS[{}] -> Branch_FU, ROB[{}], PC={:08x}", branch_issue_idx, rs_dest[branch_issue_idx], rs_pc[branch_issue_idx])
+        
+        with Condition(~branch_issue_found):
+            branch_fu_valid[0] = UInt(1)(0)
+        
+        # --- MulDiv FU Issue (仅当 md_busy=0) ---
+        muldiv_issue_idx = UInt(RS_ID_BITS)(0)
+        muldiv_issue_found = UInt(1)(0)
+        for i in range(RS_SIZE):
+            is_muldiv = (rs_func[i] == UInt(3)(FU_MUL)) | (rs_func[i] == UInt(3)(FU_DIV))
+            ready_muldiv = rs_busy[i] & ~rs_qj_valid[i] & ~rs_qk_valid[i] & is_muldiv & ~md_busy[0]
+            muldiv_issue_idx = (ready_muldiv & ~muldiv_issue_found).select(UInt(RS_ID_BITS)(i), muldiv_issue_idx)
+            muldiv_issue_found = (ready_muldiv & ~muldiv_issue_found).select(UInt(1)(1), muldiv_issue_found)
+        
+        # MulDiv 发射直接启动多周期执行 (md_* 寄存器在 ExecuteStage 处理)
+        
+        # --- LSQ FU Issue (Load/Store) ---
+        lsq_issue_idx = UInt(RS_ID_BITS)(0)
+        lsq_issue_found = UInt(1)(0)
+        for i in range(RS_SIZE):
+            is_lsq = (rs_func[i] == UInt(3)(FU_LOAD)) | (rs_func[i] == UInt(3)(FU_STORE))
+            ready_lsq = rs_busy[i] & ~rs_qj_valid[i] & ~rs_qk_valid[i] & is_lsq
+            lsq_issue_idx = (ready_lsq & ~lsq_issue_found).select(UInt(RS_ID_BITS)(i), lsq_issue_idx)
+            lsq_issue_found = (ready_lsq & ~lsq_issue_found).select(UInt(1)(1), lsq_issue_found)
+        
+        with Condition(lsq_issue_found):
+            lsq_fu_valid[0] = UInt(1)(1)
+            lsq_fu_lsq_id[0] = rs_lsq_id[lsq_issue_idx]
+            lsq_fu_vj[0] = rs_vj[lsq_issue_idx]
+            lsq_fu_vk[0] = rs_vk[lsq_issue_idx]
+            lsq_fu_imm[0] = rs_imm[lsq_issue_idx]
+            lsq_fu_dest[0] = rs_dest[lsq_issue_idx]
+            lsq_fu_is_store[0] = (rs_func[lsq_issue_idx] == UInt(3)(FU_STORE))
+            lsq_fu_control[0] = rs_control[lsq_issue_idx]
+            rs_busy[lsq_issue_idx] = UInt(1)(0)
+            log("Issue LSQ: RS[{}] -> LSQ_FU, ROB[{}], LSQ[{}], is_store={}", 
+                lsq_issue_idx, rs_dest[lsq_issue_idx], rs_lsq_id[lsq_issue_idx], (rs_func[lsq_issue_idx] == UInt(3)(FU_STORE)))
+        
+        with Condition(~lsq_issue_found):
+            lsq_fu_valid[0] = UInt(1)(0)
+        
+        # 保持原有 issue_ex 兼容性 (用于 ExecuteStage)
+        issue_valid = alu_issue_found | branch_issue_found | muldiv_issue_found | lsq_issue_found
+        
+        # 将 MulDiv 发射信息写入 issue_ex (MulDiv 走原有 ExecuteStage 路径)
+        with Condition(muldiv_issue_found):
             issue_ex_valid[0] = UInt(1)(1)
-            issue_ex_op[0] = rs_op[issue_idx]
-            issue_ex_vj[0] = rs_vj[issue_idx]
-            issue_ex_vk[0] = rs_vk[issue_idx]
-            issue_ex_dest[0] = rs_dest[issue_idx]
-            issue_ex_imm[0] = rs_imm[issue_idx]
-            issue_ex_control[0] = rs_control[issue_idx]
-            issue_ex_func[0] = rs_func[issue_idx]  # Phase 4: 传递 FU 类型
-            issue_ex_lsq_id[0] = rs_lsq_id[issue_idx]  # Phase 5: 传递 LSQ ID
-            
-            # 释放 RS
-            rs_busy[issue_idx] = UInt(1)(0)
-            
-            log("Issue: RS[{}] -> EX, ROB[{}], op={:05b}, func={:03b}, Vj={:08x}, Vk={:08x}, LSQ[{}]",
-                issue_idx, rs_dest[issue_idx], rs_op[issue_idx], rs_func[issue_idx], rs_vj[issue_idx], rs_vk[issue_idx], rs_lsq_id[issue_idx])
+            issue_ex_op[0] = rs_op[muldiv_issue_idx]
+            issue_ex_vj[0] = rs_vj[muldiv_issue_idx]
+            issue_ex_vk[0] = rs_vk[muldiv_issue_idx]
+            issue_ex_dest[0] = rs_dest[muldiv_issue_idx]
+            issue_ex_imm[0] = rs_imm[muldiv_issue_idx]
+            issue_ex_control[0] = rs_control[muldiv_issue_idx]
+            issue_ex_func[0] = rs_func[muldiv_issue_idx]
+            issue_ex_lsq_id[0] = rs_lsq_id[muldiv_issue_idx]
+            rs_busy[muldiv_issue_idx] = UInt(1)(0)
+            log("Issue MulDiv: RS[{}] -> MulDiv_FU, ROB[{}], op={:05b}", muldiv_issue_idx, rs_dest[muldiv_issue_idx], rs_op[muldiv_issue_idx])
         
-        with Condition(~issue_valid):
+        with Condition(~muldiv_issue_found):
             issue_ex_valid[0] = UInt(1)(0)
             issue_ex_op[0] = UInt(5)(0)
             issue_ex_vj[0] = UInt(XLEN)(0)
@@ -804,14 +949,13 @@ class IssueStage(Module):
             issue_ex_dest[0] = UInt(ROB_ID_BITS)(0)
             issue_ex_imm[0] = UInt(XLEN)(0)
             issue_ex_control[0] = UInt(CONTROL_LEN)(0)
-            issue_ex_func[0] = UInt(3)(0)  # Phase 4
-            issue_ex_lsq_id[0] = UInt(LSQ_ID_BITS)(0)  # Phase 5
+            issue_ex_func[0] = UInt(3)(0)
+            issue_ex_lsq_id[0] = UInt(LSQ_ID_BITS)(0)
         
         execute_stage.async_called()
         
-        return issue_valid
-
-
+        # 返回 stall 信号给 HazardUnit 用于 Stall
+        return stall_condition, issue_valid
 
 
 # ==================== Phase 5: LSQ 前递单元 ===================
@@ -870,35 +1014,72 @@ class LSQUnit(Module):
         return forward_hit, forward_data, load_blocked
 
 
-# ==================== Phase 3: 唤醒单元 ===================
+# ==================== Phase 3: 唤醒单元 (多CDB版本) ===================
 class WakeupUnit(Module):
-    """唤醒单元 - 监听 CDB，更新等待中的 RS"""
+    """唤醒单元 - 监听所有4条CDB，更新等待中的 RS"""
     def __init__(self):
         super().__init__(ports={})
     
     @module.combinational
-    def build(self, cdb_valid, cdb_tag, cdb_value,
+    def build(self, 
+              cdb_alu_valid, cdb_alu_tag, cdb_alu_value,
+              cdb_branch_valid, cdb_branch_tag, cdb_branch_value,
+              cdb_md_valid, cdb_md_tag, cdb_md_value,
+              cdb_lsq_valid, cdb_lsq_tag, cdb_lsq_value,
               rs_busy, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid):
         
-        # 当 CDB 有效时，唤醒所有等待该 tag 的 RS
-        with Condition(cdb_valid[0]):
+        # 监听 ALU CDB
+        with Condition(cdb_alu_valid[0]):
             for i in range(RS_SIZE):
-                # 检查 Qj
-                with Condition(rs_busy[i] & rs_qj_valid[i] & (rs_qj[i] == cdb_tag[0])):
-                    rs_vj[i] = cdb_value[0]
-                    rs_qj_valid[i] = UInt(1)(0)  # 不再需要等待
-                    log("Wakeup: RS[{}].Vj <- CDB[{}]={:08x}", UInt(RS_ID_BITS)(i), cdb_tag[0], cdb_value[0])
-                
-                # 检查 Qk
-                with Condition(rs_busy[i] & rs_qk_valid[i] & (rs_qk[i] == cdb_tag[0])):
-                    rs_vk[i] = cdb_value[0]
-                    rs_qk_valid[i] = UInt(1)(0)  # 不再需要等待
-                    log("Wakeup: RS[{}].Vk <- CDB[{}]={:08x}", UInt(RS_ID_BITS)(i), cdb_tag[0], cdb_value[0])
+                with Condition(rs_busy[i] & rs_qj_valid[i] & (rs_qj[i] == cdb_alu_tag[0])):
+                    rs_vj[i] = cdb_alu_value[0]
+                    rs_qj_valid[i] = UInt(1)(0)
+                    log("Wakeup ALU: RS[{}].Vj <- tag={}", UInt(RS_ID_BITS)(i), cdb_alu_tag[0])
+                with Condition(rs_busy[i] & rs_qk_valid[i] & (rs_qk[i] == cdb_alu_tag[0])):
+                    rs_vk[i] = cdb_alu_value[0]
+                    rs_qk_valid[i] = UInt(1)(0)
+                    log("Wakeup ALU: RS[{}].Vk <- tag={}", UInt(RS_ID_BITS)(i), cdb_alu_tag[0])
+        
+        # 监听 Branch CDB
+        with Condition(cdb_branch_valid[0]):
+            for i in range(RS_SIZE):
+                with Condition(rs_busy[i] & rs_qj_valid[i] & (rs_qj[i] == cdb_branch_tag[0])):
+                    rs_vj[i] = cdb_branch_value[0]
+                    rs_qj_valid[i] = UInt(1)(0)
+                    log("Wakeup Branch: RS[{}].Vj <- tag={}", UInt(RS_ID_BITS)(i), cdb_branch_tag[0])
+                with Condition(rs_busy[i] & rs_qk_valid[i] & (rs_qk[i] == cdb_branch_tag[0])):
+                    rs_vk[i] = cdb_branch_value[0]
+                    rs_qk_valid[i] = UInt(1)(0)
+                    log("Wakeup Branch: RS[{}].Vk <- tag={}", UInt(RS_ID_BITS)(i), cdb_branch_tag[0])
+        
+        # 监听 MulDiv CDB
+        with Condition(cdb_md_valid[0]):
+            for i in range(RS_SIZE):
+                with Condition(rs_busy[i] & rs_qj_valid[i] & (rs_qj[i] == cdb_md_tag[0])):
+                    rs_vj[i] = cdb_md_value[0]
+                    rs_qj_valid[i] = UInt(1)(0)
+                    log("Wakeup MulDiv: RS[{}].Vj <- tag={}", UInt(RS_ID_BITS)(i), cdb_md_tag[0])
+                with Condition(rs_busy[i] & rs_qk_valid[i] & (rs_qk[i] == cdb_md_tag[0])):
+                    rs_vk[i] = cdb_md_value[0]
+                    rs_qk_valid[i] = UInt(1)(0)
+                    log("Wakeup MulDiv: RS[{}].Vk <- tag={}", UInt(RS_ID_BITS)(i), cdb_md_tag[0])
+        
+        # 监听 LSQ CDB (Load 结果)
+        with Condition(cdb_lsq_valid[0]):
+            for i in range(RS_SIZE):
+                with Condition(rs_busy[i] & rs_qj_valid[i] & (rs_qj[i] == cdb_lsq_tag[0])):
+                    rs_vj[i] = cdb_lsq_value[0]
+                    rs_qj_valid[i] = UInt(1)(0)
+                    log("Wakeup LSQ: RS[{}].Vj <- tag={}", UInt(RS_ID_BITS)(i), cdb_lsq_tag[0])
+                with Condition(rs_busy[i] & rs_qk_valid[i] & (rs_qk[i] == cdb_lsq_tag[0])):
+                    rs_vk[i] = cdb_lsq_value[0]
+                    rs_qk_valid[i] = UInt(1)(0)
+                    log("Wakeup LSQ: RS[{}].Vk <- tag={}", UInt(RS_ID_BITS)(i), cdb_lsq_tag[0])
 
 
-# ==================== WB阶段：写回 ===================
+# ==================== WB阶段：写回 (多CDB版本) ===================
 class WriteBackStage(Module):
-    """写回阶段(WB)"""
+    """写回阶段(WB) - 接收多条CDB并更新ROB"""
     def __init__(self):
         super().__init__(ports={})
     
@@ -908,7 +1089,11 @@ class WriteBackStage(Module):
               rob_head, rob_valid, rob_ready, rob_value, rob_dest,  # Phase 2: ROB arrays
               rob_is_store, rob_lsq_id,  # Phase 5: Store info in ROB
               rat_valid, rat_tag,  # Phase 2: RAT for clearing on commit
-              cdb_valid, cdb_tag, cdb_value,  # Phase 3: CDB
+              # 多 FU 并行: 4条独立CDB
+              cdb_alu_valid, cdb_alu_tag, cdb_alu_value,
+              cdb_branch_valid, cdb_branch_tag, cdb_branch_value,
+              cdb_md_valid, cdb_md_tag, cdb_md_value,
+              cdb_lsq_valid, cdb_lsq_tag, cdb_lsq_value,
               # Phase 5: LSQ for Store commit
               lsq_valid, lsq_addr, lsq_data, lsq_head,
               reg_file, data_sram):
@@ -916,7 +1101,7 @@ class WriteBackStage(Module):
         ex_result_in = mem_wb_ex_result[0]
         control_in = mem_wb_control[0]
         
-            # 解析控制信号
+        # 解析控制信号
         reg_write = control_in[7:7]
         mem_to_reg = control_in[8:8]
         wb_rd = control_in[25:29]
@@ -924,20 +1109,30 @@ class WriteBackStage(Module):
         # 选择写回数据
         wb_data = mem_to_reg.select(mem_data_in, ex_result_in)
             
-        # ========== Phase 2: ROB Writeback + Phase 3: CDB 广播 ==========
-        current_rob_id = mem_wb_rob_id[0]
-        with Condition(mem_wb_valid[0] & reg_write):
-            # 更新 ROB：结果就绪
-            rob_ready[current_rob_id] = UInt(1)(1)
-            rob_value[current_rob_id] = wb_data
-            
-            # Phase 3: 广播到 CDB
-            cdb_tag[0] = current_rob_id
-            cdb_value[0] = wb_data
-            
-            log("ROB Writeback + CDB: ID={}, Value={:08x}, Dest=x{}", current_rob_id, wb_data, wb_rd)
+        # ========== 多 CDB ROB Writeback ==========
+        # ALU CDB -> ROB
+        with Condition(cdb_alu_valid[0]):
+            rob_ready[cdb_alu_tag[0]] = UInt(1)(1)
+            rob_value[cdb_alu_tag[0]] = cdb_alu_value[0]
+            log("ROB WB ALU: ID={}, Value={:08x}", cdb_alu_tag[0], cdb_alu_value[0])
         
-        cdb_valid[0] = (mem_wb_valid[0] & reg_write).bitcast(UInt(1))
+        # Branch CDB -> ROB
+        with Condition(cdb_branch_valid[0]):
+            rob_ready[cdb_branch_tag[0]] = UInt(1)(1)
+            rob_value[cdb_branch_tag[0]] = cdb_branch_value[0]
+            log("ROB WB Branch: ID={}, Value={:08x}", cdb_branch_tag[0], cdb_branch_value[0])
+        
+        # MulDiv CDB -> ROB
+        with Condition(cdb_md_valid[0]):
+            rob_ready[cdb_md_tag[0]] = UInt(1)(1)
+            rob_value[cdb_md_tag[0]] = cdb_md_value[0]
+            log("ROB WB MulDiv: ID={}, Value={:08x}", cdb_md_tag[0], cdb_md_value[0])
+        
+        # LSQ CDB -> ROB (Load 结果)
+        with Condition(cdb_lsq_valid[0]):
+            rob_ready[cdb_lsq_tag[0]] = UInt(1)(1)
+            rob_value[cdb_lsq_tag[0]] = cdb_lsq_value[0]
+            log("ROB WB LSQ: ID={}, Value={:08x}", cdb_lsq_tag[0], cdb_lsq_value[0])
         
         # ========== Phase 2: ROB Commit（顺序提交）==========
         head_id = rob_head[0]
@@ -1232,6 +1427,7 @@ def build_cpu(program_file="test_program.txt"):
         rs_func = RegArray(UInt(3), RS_SIZE, initializer=[0]*RS_SIZE)          # 功能单元类型
         rs_control = RegArray(UInt(CONTROL_LEN), RS_SIZE, initializer=[0]*RS_SIZE)  # 控制信号
         rs_lsq_id = RegArray(UInt(LSQ_ID_BITS), RS_SIZE, initializer=[0]*RS_SIZE)  # Phase 5: 对应 LSQ ID
+        rs_pc = RegArray(UInt(XLEN), RS_SIZE, initializer=[0]*RS_SIZE)         # 指令 PC (用于分支目标计算)
         
         # ==================== Phase 5: LSQ 数据结构 ====================
         lsq_valid = RegArray(UInt(1), LSQ_SIZE, initializer=[0]*LSQ_SIZE)       # 是否有效
@@ -1246,12 +1442,55 @@ def build_cpu(program_file="test_program.txt"):
         lsq_head = RegArray(UInt(LSQ_ID_BITS), 1, initializer=[0])  # 最旧条目
         lsq_tail = RegArray(UInt(LSQ_ID_BITS), 1, initializer=[0])  # 下一个分配位置
         
-        # ==================== Phase 3: CDB 数据结构 ====================
-        cdb_valid = RegArray(UInt(1), 1, initializer=[0])
-        cdb_tag = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])   # 结果对应的 ROB ID
-        cdb_value = RegArray(UInt(XLEN), 1, initializer=[0])        # 结果值
+        # ==================== 多FU并行: 4条独立CDB ====================
+        # ALU CDB
+        cdb_alu_valid = RegArray(UInt(1), 1, initializer=[0])
+        cdb_alu_tag = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
+        cdb_alu_value = RegArray(UInt(XLEN), 1, initializer=[0])
+        # Branch CDB
+        cdb_branch_valid = RegArray(UInt(1), 1, initializer=[0])
+        cdb_branch_tag = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
+        cdb_branch_value = RegArray(UInt(XLEN), 1, initializer=[0])
+        # MulDiv CDB
+        cdb_md_valid = RegArray(UInt(1), 1, initializer=[0])
+        cdb_md_tag = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
+        cdb_md_value = RegArray(UInt(XLEN), 1, initializer=[0])
+        # LSQ CDB (Load结果)
+        cdb_lsq_valid = RegArray(UInt(1), 1, initializer=[0])
+        cdb_lsq_tag = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
+        cdb_lsq_value = RegArray(UInt(XLEN), 1, initializer=[0])
         
-        # ==================== Phase 3: Issue/EX 流水线寄存器 ====================
+        # ==================== 多FU并行: 各FU独立发射寄存器 ====================
+        # ALU FU 寄存器 (单周期)
+        alu_fu_valid = RegArray(UInt(1), 1, initializer=[0])
+        alu_fu_op = RegArray(UInt(5), 1, initializer=[0])
+        alu_fu_vj = RegArray(UInt(XLEN), 1, initializer=[0])
+        alu_fu_vk = RegArray(UInt(XLEN), 1, initializer=[0])
+        alu_fu_dest = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
+        alu_fu_imm = RegArray(UInt(XLEN), 1, initializer=[0])
+        alu_fu_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])
+        alu_fu_pc = RegArray(UInt(XLEN), 1, initializer=[0])
+        
+        # Branch FU 寄存器 (单周期)
+        branch_fu_valid = RegArray(UInt(1), 1, initializer=[0])
+        branch_fu_vj = RegArray(UInt(XLEN), 1, initializer=[0])
+        branch_fu_vk = RegArray(UInt(XLEN), 1, initializer=[0])
+        branch_fu_dest = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
+        branch_fu_imm = RegArray(UInt(XLEN), 1, initializer=[0])
+        branch_fu_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])
+        branch_fu_pc = RegArray(UInt(XLEN), 1, initializer=[0])
+        
+        # LSQ FU 寄存器 (Load/Store)
+        lsq_fu_valid = RegArray(UInt(1), 1, initializer=[0])
+        lsq_fu_lsq_id = RegArray(UInt(LSQ_ID_BITS), 1, initializer=[0])
+        lsq_fu_vj = RegArray(UInt(XLEN), 1, initializer=[0])
+        lsq_fu_vk = RegArray(UInt(XLEN), 1, initializer=[0])
+        lsq_fu_imm = RegArray(UInt(XLEN), 1, initializer=[0])
+        lsq_fu_dest = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
+        lsq_fu_is_store = RegArray(UInt(1), 1, initializer=[0])
+        lsq_fu_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])
+        
+        # 保留原有的 issue_ex 寄存器用于兼容 (后续逐步移除)
         issue_ex_valid = RegArray(UInt(1), 1, initializer=[0])
         issue_ex_op = RegArray(UInt(5), 1, initializer=[0])
         issue_ex_vj = RegArray(UInt(XLEN), 1, initializer=[0])
@@ -1305,8 +1544,7 @@ def build_cpu(program_file="test_program.txt"):
         data_sram = SRAM(width=XLEN, depth=65536, init_file="data.hex")
         hazard_unit = HazardUnit()
         wakeup_unit = WakeupUnit()  # Phase 3
-        dispatch_stage = DispatchStage()  # Phase 3
-        issue_stage = IssueStage()  # Phase 3
+        dispatch_issue_stage = DispatchIssueStage()  # Phase 3: 合并的分派发射阶段
         lsq_unit = LSQUnit()  # Phase 5: LSQ forwarding unit
         fetch_stage = FetchStage()
         decode_stage = DecodeStage()
@@ -1321,7 +1559,11 @@ def build_cpu(program_file="test_program.txt"):
                                                    rob_head, rob_valid, rob_ready, rob_value, rob_dest,  # Phase 2
                                                    rob_is_store, rob_lsq_id,  # Phase 5: Store info in ROB
                                                    rat_valid, rat_tag,  # Phase 2
-                                                   cdb_valid, cdb_tag, cdb_value,  # Phase 3
+                                                   # 多 FU 并行: 4条独立CDB
+                                                   cdb_alu_valid, cdb_alu_tag, cdb_alu_value,
+                                                   cdb_branch_valid, cdb_branch_tag, cdb_branch_value,
+                                                   cdb_md_valid, cdb_md_tag, cdb_md_value,
+                                                   cdb_lsq_valid, cdb_lsq_tag, cdb_lsq_value,
                                                    # Phase 5: LSQ for Store commit
                                                    lsq_valid, lsq_addr, lsq_data, lsq_head,
                                                    reg_file, data_sram)
@@ -1350,23 +1592,36 @@ def build_cpu(program_file="test_program.txt"):
                                                    md_pending, md_pending_value, md_pending_dest,
                                                    # Phase 5: LSQ 相关
                                                    issue_ex_lsq_id, lsq_addr, lsq_addr_ready, lsq_data, lsq_data_ready,
+                                                   # 多 FU 并行: 各 FU 输入和 CDB 输出
+                                                   alu_fu_valid, alu_fu_op, alu_fu_vj, alu_fu_vk, alu_fu_dest, alu_fu_imm, alu_fu_control,
+                                                   branch_fu_valid, branch_fu_vj, branch_fu_vk, branch_fu_dest, branch_fu_imm, branch_fu_control, branch_fu_pc,
+                                                   lsq_fu_valid, lsq_fu_lsq_id, lsq_fu_vj, lsq_fu_vk, lsq_fu_imm, lsq_fu_dest, lsq_fu_is_store, lsq_fu_control,
+                                                   cdb_alu_valid, cdb_alu_tag, cdb_alu_value,
+                                                   cdb_branch_valid, cdb_branch_tag, cdb_branch_value,
+                                                   cdb_md_valid, cdb_md_tag, cdb_md_value,
+                                                   cdb_lsq_valid, cdb_lsq_tag, cdb_lsq_value,
                                                    reg_file, memory_stage)
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2,
                                           rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
                                           rob_old_tag_valid, rob_old_tag,
-                                          rs_busy, rs_op, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid, rs_dest, rs_imm, rs_func, rs_control,
-                                          reg_file, dispatch_stage, issue_stage, execute_stage)
+                                          rs_busy, rs_op, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid, rs_dest, rs_imm, rs_func, rs_control, rs_lsq_id, rs_pc,
+                                          lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready, lsq_addr, lsq_data, lsq_rob_id, lsq_done, lsq_head, lsq_tail,
+                                          rob_is_store, rob_lsq_id,
+                                          issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control, issue_ex_func, issue_ex_lsq_id,
+                                          md_busy,
+                                          # 多 FU 并行: 各 FU 寄存器
+                                          alu_fu_valid, alu_fu_op, alu_fu_vj, alu_fu_vk, alu_fu_dest, alu_fu_imm, alu_fu_control,
+                                          branch_fu_valid, branch_fu_vj, branch_fu_vk, branch_fu_dest, branch_fu_imm, branch_fu_control, branch_fu_pc,
+                                          lsq_fu_valid, lsq_fu_lsq_id, lsq_fu_vj, lsq_fu_vk, lsq_fu_imm, lsq_fu_dest, lsq_fu_is_store, lsq_fu_control,
+                                          reg_file, dispatch_issue_stage, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, instruction_memory, decode_stage)
-        # Phase 3: 发射阶段
-        issue_stage.build(rs_busy, rs_op, rs_vj, rs_vk, rs_qj_valid, rs_qk_valid,
-                          rs_dest, rs_imm, rs_func, rs_control, rs_lsq_id,  # Phase 5: 新增 rs_lsq_id
-                          issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control, issue_ex_func,
-                          issue_ex_lsq_id,  # Phase 5: 新增 issue_ex_lsq_id
-                          md_busy,  # Phase 4
-                          execute_stage)
+        # Phase 3: 分派发射阶段 - 已合并到 DecodeStage 内部调用
         
-        # Phase 3: 唤醒单元
-        wakeup_unit.build(cdb_valid, cdb_tag, cdb_value,
+        # Phase 3: 唤醒单元 (多CDB版本)
+        wakeup_unit.build(cdb_alu_valid, cdb_alu_tag, cdb_alu_value,
+                          cdb_branch_valid, cdb_branch_tag, cdb_branch_value,
+                          cdb_md_valid, cdb_md_tag, cdb_md_value,
+                          cdb_lsq_valid, cdb_lsq_tag, cdb_lsq_value,
                           rs_busy, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid)
         
         hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate,
