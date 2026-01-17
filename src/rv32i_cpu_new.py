@@ -19,6 +19,16 @@ CONTROL_LEN = 42 # 控制信号长度
 ROB_SIZE = 16       # ROB 大小
 ROB_ID_BITS = 4     # ROB ID 位宽 (log2(16) = 4)
 
+# Phase 3: RS 相关常量
+RS_SIZE = 8         # RS 条目数量
+RS_ID_BITS = 3      # RS ID 位宽 (log2(8) = 3)
+
+# 功能单元类型编码
+FU_ALU    = 0b000   # ALU 运算
+FU_BRANCH = 0b001   # 分支计算
+FU_LOAD   = 0b010   # Load
+FU_STORE  = 0b011   # Store
+
 # ==================== IF阶段：指令获取 ===================
 class FetchStage(Module):
     """指令获取阶段(IF)"""
@@ -286,9 +296,21 @@ class DecodeStage(Module):
         # immediate = (~if_id_valid[0]).select(UInt(XLEN)(0), immediate)
         # control_signals = (~if_id_valid[0]).select(Bits(CONTROL_LEN)(0), control_signals)
 
+        # Phase 3: 调用 Dispatch 阶段将指令放入 RS
+        dispatch_valid = if_id_valid[0] & id_ex_valid[0] & ~rob_full
+        rs_full = dispatch_stage.build(
+            dispatch_valid, control_signals.bitcast(UInt(CONTROL_LEN)), immediate, allocated_rob_id, if_id_pc_in,
+            rs1_value, rs1_tag_out, rs1_ready,
+            rs2_value, rs2_tag_out, rs2_ready,
+            rs_busy, rs_op, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid,
+            rs_dest_arr, rs_imm, rs_func, rs_control,
+            issue_stage)
+        
         execute_stage.async_called()
 
         decode_signals = concat(
+            # rs_full 信号
+            id_ex_valid[0].select(if_id_valid[0].select(rs_full, UInt(1)(0)), UInt(1)(0)),  # RS满标志
             # OoO 相关信号
             id_ex_valid[0].select(if_id_valid[0].select(rob_full, UInt(1)(0)), UInt(1)(0)),  # ROB满标志 (新增)
             id_ex_valid[0].select(if_id_valid[0].select(allocated_rob_id, UInt(ROB_ID_BITS)(0)), UInt(ROB_ID_BITS)(0)),  # 分配的ROB ID
@@ -490,6 +512,154 @@ class MemoryStage(Module):
         memory_signals = mem_wb_valid[0].select(ex_mem_valid[0].select(control_in.bitcast(Bits(CONTROL_LEN)), Bits(CONTROL_LEN)(0)), mem_wb_control[0].bitcast(Bits(CONTROL_LEN)))
         return memory_signals
 
+# ==================== Phase 3: 分派阶段 ===================
+class DispatchStage(Module):
+    """指令分派阶段 - 将解码后的指令放入 Reservation Station"""
+    def __init__(self):
+        super().__init__(ports={})
+    
+    @module.combinational
+    def build(self, dispatch_valid, dispatch_control, dispatch_immediate, dispatch_rob_id, dispatch_pc,
+              rs1_value, rs1_tag, rs1_ready,
+              rs2_value, rs2_tag, rs2_ready,
+              rs_busy, rs_op, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid, 
+              rs_dest, rs_imm, rs_func, rs_control,
+              issue_stage):
+        
+        # 解析控制信号
+        alu_op = dispatch_control[0:4]
+        mem_read = dispatch_control[5:5]
+        mem_write = dispatch_control[6:6]
+        reg_write = dispatch_control[7:7]
+        branch_op = dispatch_control[17:19]
+        
+        # 确定功能单元类型
+        fu_type = UInt(3)(FU_ALU)  # 默认为 ALU
+        fu_type = (branch_op != UInt(3)(0)).select(UInt(3)(FU_BRANCH), fu_type)
+        fu_type = mem_read.select(UInt(3)(FU_LOAD), fu_type)
+        fu_type = mem_write.select(UInt(3)(FU_STORE), fu_type)
+        
+        # 找空闲 RS (简单优先级编码)
+        rs_free = UInt(RS_ID_BITS)(0)
+        rs_found = UInt(1)(0)
+        for i in range(RS_SIZE):
+            with Condition(~rs_busy[i] & ~rs_found):
+                rs_free = UInt(RS_ID_BITS)(i)
+                rs_found = UInt(1)(1)
+        
+        # RS 满检测
+        rs_full = ~rs_found
+        
+        # 分配 RS（仅当有有效指令且 RS 未满）
+        with Condition(dispatch_valid & ~rs_full):
+            rs_busy[rs_free] = UInt(1)(1)
+            rs_op[rs_free] = alu_op
+            rs_dest[rs_free] = dispatch_rob_id
+            rs_imm[rs_free] = dispatch_immediate
+            rs_func[rs_free] = fu_type
+            rs_control[rs_free] = dispatch_control
+            
+            # 源操作数1
+            rs_vj[rs_free] = rs1_ready.select(rs1_value, UInt(XLEN)(0))
+            rs_qj[rs_free] = rs1_tag
+            rs_qj_valid[rs_free] = ~rs1_ready  # 需要等待
+            
+            # 源操作数2
+            rs_vk[rs_free] = rs2_ready.select(rs2_value, UInt(XLEN)(0))
+            rs_qk[rs_free] = rs2_tag
+            rs_qk_valid[rs_free] = ~rs2_ready  # 需要等待
+            
+            log("Dispatch: RS[{}] <- ROB[{}], op={:05b}, Vj={:08x}, Qj={}, Qj_valid={}, Vk={:08x}, Qk={}, Qk_valid={}",
+                rs_free, dispatch_rob_id, alu_op, rs_vj[rs_free], rs_qj[rs_free], rs_qj_valid[rs_free],
+                rs_vk[rs_free], rs_qk[rs_free], rs_qk_valid[rs_free])
+        
+        issue_stage.async_called()
+        
+        # 返回 rs_full 信号给 HazardUnit 用于 Stall
+        return rs_full
+
+
+# ==================== Phase 3: 发射阶段 ===================
+class IssueStage(Module):
+    """发射阶段 - 选择操作数就绪的指令送往执行单元"""
+    def __init__(self):
+        super().__init__(ports={})
+    
+    @module.combinational
+    def build(self, rs_busy, rs_op, rs_vj, rs_vk, rs_qj_valid, rs_qk_valid, 
+              rs_dest, rs_imm, rs_func, rs_control,
+              issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control,
+              execute_stage):
+        
+        # 选择就绪的指令 (Qj_valid=0 且 Qk_valid=0 表示操作数都就绪)
+        issue_idx = UInt(RS_ID_BITS)(0)
+        issue_found = UInt(1)(0)
+        
+        for i in range(RS_SIZE):
+            ready = rs_busy[i] & ~rs_qj_valid[i] & ~rs_qk_valid[i]
+            with Condition(ready & ~issue_found):
+                issue_idx = UInt(RS_ID_BITS)(i)
+                issue_found = UInt(1)(1)
+        
+        # 发射选中的指令
+        issue_valid = issue_found
+        
+        with Condition(issue_valid):
+            # 写入 Issue/EX 流水线寄存器
+            issue_ex_valid[0] = UInt(1)(1)
+            issue_ex_op[0] = rs_op[issue_idx]
+            issue_ex_vj[0] = rs_vj[issue_idx]
+            issue_ex_vk[0] = rs_vk[issue_idx]
+            issue_ex_dest[0] = rs_dest[issue_idx]
+            issue_ex_imm[0] = rs_imm[issue_idx]
+            issue_ex_control[0] = rs_control[issue_idx]
+            
+            # 释放 RS
+            rs_busy[issue_idx] = UInt(1)(0)
+            
+            log("Issue: RS[{}] -> EX, ROB[{}], op={:05b}, Vj={:08x}, Vk={:08x}",
+                issue_idx, rs_dest[issue_idx], rs_op[issue_idx], rs_vj[issue_idx], rs_vk[issue_idx])
+        
+        with Condition(~issue_valid):
+            issue_ex_valid[0] = UInt(1)(0)
+            issue_ex_op[0] = UInt(5)(0)
+            issue_ex_vj[0] = UInt(XLEN)(0)
+            issue_ex_vk[0] = UInt(XLEN)(0)
+            issue_ex_dest[0] = UInt(ROB_ID_BITS)(0)
+            issue_ex_imm[0] = UInt(XLEN)(0)
+            issue_ex_control[0] = UInt(CONTROL_LEN)(0)
+        
+        execute_stage.async_called()
+        
+        return issue_valid
+
+
+# ==================== Phase 3: 唤醒单元 ===================
+class WakeupUnit(Module):
+    """唤醒单元 - 监听 CDB，更新等待中的 RS"""
+    def __init__(self):
+        super().__init__(ports={})
+    
+    @module.combinational
+    def build(self, cdb_valid, cdb_tag, cdb_value,
+              rs_busy, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid):
+        
+        # 当 CDB 有效时，唤醒所有等待该 tag 的 RS
+        with Condition(cdb_valid[0]):
+            for i in range(RS_SIZE):
+                # 检查 Qj
+                with Condition(rs_busy[i] & rs_qj_valid[i] & (rs_qj[i] == cdb_tag[0])):
+                    rs_vj[i] = cdb_value[0]
+                    rs_qj_valid[i] = UInt(1)(0)  # 不再需要等待
+                    log("Wakeup: RS[{}].Vj <- CDB[{}]={:08x}", UInt(RS_ID_BITS)(i), cdb_tag[0], cdb_value[0])
+                
+                # 检查 Qk
+                with Condition(rs_busy[i] & rs_qk_valid[i] & (rs_qk[i] == cdb_tag[0])):
+                    rs_vk[i] = cdb_value[0]
+                    rs_qk_valid[i] = UInt(1)(0)  # 不再需要等待
+                    log("Wakeup: RS[{}].Vk <- CDB[{}]={:08x}", UInt(RS_ID_BITS)(i), cdb_tag[0], cdb_value[0])
+
+
 # ==================== WB阶段：写回 ===================
 class WriteBackStage(Module):
     """写回阶段(WB)"""
@@ -501,6 +671,7 @@ class WriteBackStage(Module):
               mem_wb_rob_id,  # Phase 2: ROB ID
               rob_head, rob_valid, rob_ready, rob_value, rob_dest,  # Phase 2: ROB arrays
               rat_valid, rat_tag,  # Phase 2: RAT for clearing on commit
+              cdb_valid, cdb_tag, cdb_value,  # Phase 3: CDB
               reg_file, data_sram):
         mem_data_in = data_sram.dout[0]
         ex_result_in = mem_wb_ex_result[0]
@@ -514,13 +685,20 @@ class WriteBackStage(Module):
         # 选择写回数据
         wb_data = mem_to_reg.select(mem_data_in, ex_result_in)
             
-        # ========== Phase 2: ROB Writeback ==========
+        # ========== Phase 2: ROB Writeback + Phase 3: CDB 广播 ==========
         current_rob_id = mem_wb_rob_id[0]
         with Condition(mem_wb_valid[0] & reg_write):
             # 更新 ROB：结果就绪
             rob_ready[current_rob_id] = UInt(1)(1)
             rob_value[current_rob_id] = wb_data
-            log("ROB Writeback: ID={}, Value={:08x}, Dest=x{}", current_rob_id, wb_data, wb_rd)
+            
+            # Phase 3: 广播到 CDB
+            cdb_tag[0] = current_rob_id
+            cdb_value[0] = wb_data
+            
+            log("ROB Writeback + CDB: ID={}, Value={:08x}, Dest=x{}", current_rob_id, wb_data, wb_rd)
+        
+        cdb_valid[0] = (mem_wb_valid[0] & reg_write).bitcast(UInt(1))
         
         # ========== Phase 2: ROB Commit（顺序提交）==========
         head_id = rob_head[0]
@@ -557,6 +735,7 @@ class HazardUnit(Downstream):
     @downstream.combinational
     def build(self, pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, ex_mem_valid, mem_wb_valid, 
               rob_valid, rob_ready, rob_tail, rob_dest, rob_old_tag_valid, rob_old_tag, rat_valid, rat_tag,
+              rs_busy, rs_dest,  # Phase 3: RS for Walk-back
               fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals):
 
         execute_signals = execute_signals.optional(Bits(XLEN + 1 + CONTROL_LEN)(0))
@@ -604,6 +783,9 @@ class HazardUnit(Downstream):
         reg_write_decode = control_in[7:7]
         rob_stall = rob_full & reg_write_decode
         
+        # Phase 3: RS 满 Stall
+        rs_stall = rs_full & if_id_valid[0]
+        
         data_hazard_ex = (reg_write_mem & ((needs_rs1 & (rs1 == rd_mem)) | (needs_rs2 & (rs2 == rd_mem)))).select(UInt(1)(1), data_hazard_ex)
 
         data_hazard_wb = (reg_write_wb & ((needs_rs1 & (rs1 == rd_wb)) | (needs_rs2 & (rs2 == rd_wb)))).select(UInt(1)(1), data_hazard_wb)
@@ -618,21 +800,21 @@ class HazardUnit(Downstream):
         nop_control = UInt(CONTROL_LEN)(0) # NOP控制信号，全0表示无操作
 
         # 更新PC和IF/ID寄存器        
-        pc[0] = pc_change.select(target_pc, (data_hazard | rob_stall).select(pc[0], pc[0] + UInt(XLEN)(4)))
+        pc[0] = pc_change.select(target_pc, (data_hazard | rob_stall | rs_stall).select(pc[0], pc[0] + UInt(XLEN)(4)))
 
-        if_id_instruction[0] = pc_change.select(UInt(XLEN)(0x00000013), (if_id_valid[0] & ~rob_stall).select(stall[0].select(UInt(XLEN)(0x00000013), instruction), if_id_instruction[0]))  # NOP指令
+        if_id_instruction[0] = pc_change.select(UInt(XLEN)(0x00000013), (if_id_valid[0] & ~rob_stall & ~rs_stall).select(stall[0].select(UInt(XLEN)(0x00000013), instruction), if_id_instruction[0]))  # NOP指令
         
         # 提取 allocated_rob_id（在 decode_signals 中 rob_full 之前 ROB_ID_BITS 位）
         allocated_rob_id_offset = 2 + CONTROL_LEN + 5 + 5 + XLEN + 3*ROB_ID_BITS + 2*XLEN + 2 - ROB_ID_BITS
         allocated_rob_id = decode_signals[allocated_rob_id_offset:allocated_rob_id_offset + ROB_ID_BITS - 1].bitcast(UInt(ROB_ID_BITS))
         
         with Condition(id_ex_valid[0]):
-            id_ex_control[0] = (pc_change | rob_stall).select(nop_control, control_in)
-            id_ex_immediate[0] = (pc_change | rob_stall).select(UInt(XLEN)(0), immediate)
-            id_ex_rs1_idx[0] = (pc_change | rob_stall).select(UInt(5)(0), rs1)
-            id_ex_rs2_idx[0] = (pc_change | rob_stall).select(UInt(5)(0), rs2)
+            id_ex_control[0] = (pc_change | rob_stall | rs_stall).select(nop_control, control_in)
+            id_ex_immediate[0] = (pc_change | rob_stall | rs_stall).select(UInt(XLEN)(0), immediate)
+            id_ex_rs1_idx[0] = (pc_change | rob_stall | rs_stall).select(UInt(5)(0), rs1)
+            id_ex_rs2_idx[0] = (pc_change | rob_stall | rs_stall).select(UInt(5)(0), rs2)
             # Phase 2: 写入 ROB ID
-            id_ex_rob_id[0] = (pc_change | rob_stall).select(UInt(ROB_ID_BITS)(0), allocated_rob_id)
+            id_ex_rob_id[0] = (pc_change | rob_stall | rs_stall).select(UInt(ROB_ID_BITS)(0), allocated_rob_id)
 
         # ==================== Walk-back 恢复逻辑 ====================
         # 当 pc_change=1 且 ID 阶段有有效指令且该指令有写寄存器操作时
@@ -653,6 +835,14 @@ class HazardUnit(Downstream):
             rob_tail[0] = flush_rob_id  # tail 回退到 flush 点
             
             log("Walk-back: flush ROB[{}], dest=x{}", flush_rob_id, flush_dest)
+        
+        # Phase 3: Walk-back 时选择性清空 RS
+        # 只清空那些指向已被清除 ROB 的条目
+        with Condition(pc_change):
+            for i in range(RS_SIZE):
+                with Condition(rs_busy[i] & ~rob_valid[rs_dest[i]]):
+                    rs_busy[i] = UInt(1)(0)
+                    log("Walk-back: RS[{}] cleared (ROB[{}] invalid)", UInt(RS_ID_BITS)(i), rs_dest[i])
 
         log("RD_MEM={}, REG_WRITE_MEM={}, RD_WB={}, REG_WRITE_WB={}",
             rd_mem, reg_write_mem, rd_wb, reg_write_wb)
@@ -738,6 +928,34 @@ def build_cpu(program_file="test_program.txt"):
         rob_old_tag_valid = RegArray(UInt(1), ROB_SIZE, initializer=[0]*ROB_SIZE)  # 旧 RAT valid
         rob_old_tag = RegArray(UInt(ROB_ID_BITS), ROB_SIZE, initializer=[0]*ROB_SIZE)  # 旧 RAT tag
 
+        # ==================== Phase 3: RS 数据结构 ====================
+        rs_busy = RegArray(UInt(1), RS_SIZE, initializer=[0]*RS_SIZE)          # 是否被占用
+        rs_op = RegArray(UInt(5), RS_SIZE, initializer=[0]*RS_SIZE)            # ALU 操作码
+        rs_vj = RegArray(UInt(XLEN), RS_SIZE, initializer=[0]*RS_SIZE)         # 源操作数1的值
+        rs_vk = RegArray(UInt(XLEN), RS_SIZE, initializer=[0]*RS_SIZE)         # 源操作数2的值
+        rs_qj = RegArray(UInt(ROB_ID_BITS), RS_SIZE, initializer=[0]*RS_SIZE)  # 源操作数1的 ROB tag
+        rs_qk = RegArray(UInt(ROB_ID_BITS), RS_SIZE, initializer=[0]*RS_SIZE)  # 源操作数2的 ROB tag
+        rs_qj_valid = RegArray(UInt(1), RS_SIZE, initializer=[0]*RS_SIZE)      # Qj 是否有效 (需要等待)
+        rs_qk_valid = RegArray(UInt(1), RS_SIZE, initializer=[0]*RS_SIZE)      # Qk 是否有效 (需要等待)
+        rs_dest = RegArray(UInt(ROB_ID_BITS), RS_SIZE, initializer=[0]*RS_SIZE)# 目标 ROB ID
+        rs_imm = RegArray(UInt(XLEN), RS_SIZE, initializer=[0]*RS_SIZE)        # 立即数
+        rs_func = RegArray(UInt(3), RS_SIZE, initializer=[0]*RS_SIZE)          # 功能单元类型
+        rs_control = RegArray(UInt(CONTROL_LEN), RS_SIZE, initializer=[0]*RS_SIZE)  # 控制信号
+        
+        # ==================== Phase 3: CDB 数据结构 ====================
+        cdb_valid = RegArray(UInt(1), 1, initializer=[0])
+        cdb_tag = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])   # 结果对应的 ROB ID
+        cdb_value = RegArray(UInt(XLEN), 1, initializer=[0])        # 结果值
+        
+        # ==================== Phase 3: Issue/EX 流水线寄存器 ====================
+        issue_ex_valid = RegArray(UInt(1), 1, initializer=[0])
+        issue_ex_op = RegArray(UInt(5), 1, initializer=[0])
+        issue_ex_vj = RegArray(UInt(XLEN), 1, initializer=[0])
+        issue_ex_vk = RegArray(UInt(XLEN), 1, initializer=[0])
+        issue_ex_dest = RegArray(UInt(ROB_ID_BITS), 1, initializer=[0])
+        issue_ex_imm = RegArray(UInt(XLEN), 1, initializer=[0])
+        issue_ex_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])
+
         # EX/MEM阶段寄存器
         ex_mem_pc = RegArray(UInt(XLEN), 1, initializer=[0])           # PC (32位)
         ex_mem_control = RegArray(UInt(CONTROL_LEN), 1, initializer=[0])  # 控制信号 (42位)
@@ -767,6 +985,9 @@ def build_cpu(program_file="test_program.txt"):
         
         data_sram = SRAM(width=XLEN, depth=65536, init_file="data.hex")
         hazard_unit = HazardUnit()
+        wakeup_unit = WakeupUnit()  # Phase 3
+        dispatch_stage = DispatchStage()  # Phase 3
+        issue_stage = IssueStage()  # Phase 3
         fetch_stage = FetchStage()
         decode_stage = DecodeStage()
         execute_stage = ExecuteStage()
@@ -779,6 +1000,7 @@ def build_cpu(program_file="test_program.txt"):
                                                    mem_wb_rob_id,  # Phase 2
                                                    rob_head, rob_valid, rob_ready, rob_value, rob_dest,  # Phase 2
                                                    rat_valid, rat_tag,  # Phase 2
+                                                   cdb_valid, cdb_tag, cdb_value,  # Phase 3
                                                    reg_file, data_sram)
         memory_signals = memory_stage.build(ex_mem_valid, ex_mem_result, ex_mem_pc, ex_mem_data, ex_mem_control,
                                                  ex_mem_rob_id,  # Phase 2
@@ -793,12 +1015,24 @@ def build_cpu(program_file="test_program.txt"):
         decode_signals = decode_stage.build(if_id_valid, if_id_pc, if_id_instruction, id_ex_pc, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate, id_ex_need_rs1, id_ex_need_rs2,
                                           rat_valid, rat_tag, rob_head, rob_tail, rob_valid, rob_ready, rob_value, rob_dest, rob_pc,
                                           rob_old_tag_valid, rob_old_tag,
-                                          reg_file, execute_stage)
+                                          rs_busy, rs_op, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid, rs_dest, rs_imm, rs_func, rs_control,
+                                          reg_file, dispatch_stage, issue_stage, execute_stage)
         fetch_signals = fetch_stage.build(pc, stall, if_id_pc, if_id_instruction, if_id_valid, instruction_memory, decode_stage)
+        # Phase 3: 发射阶段
+        issue_stage.build(rs_busy, rs_op, rs_vj, rs_vk, rs_qj_valid, rs_qk_valid,
+                          rs_dest, rs_imm, rs_func, rs_control,
+                          issue_ex_valid, issue_ex_op, issue_ex_vj, issue_ex_vk, issue_ex_dest, issue_ex_imm, issue_ex_control,
+                          execute_stage)
+        
+        # Phase 3: 唤醒单元
+        wakeup_unit.build(cdb_valid, cdb_tag, cdb_value,
+                          rs_busy, rs_vj, rs_vk, rs_qj, rs_qk, rs_qj_valid, rs_qk_valid)
+        
         hazard_unit.build(pc, stall, if_id_valid, if_id_instruction, id_ex_control, id_ex_valid, id_ex_rs1_idx, id_ex_rs2_idx, id_ex_immediate,
                           id_ex_rob_id,  # Phase 2
                           ex_mem_valid, mem_wb_valid,
                           rob_valid, rob_ready, rob_tail, rob_dest, rob_old_tag_valid, rob_old_tag, rat_valid, rat_tag,
+                          rs_busy, rs_dest,  # Phase 3
                           fetch_signals, decode_signals, execute_signals, memory_signals, writeback_signals)
         
         # 构建Driver模块，处理PC更新
