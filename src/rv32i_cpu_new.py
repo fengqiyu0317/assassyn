@@ -318,6 +318,8 @@ class DecodeStage(Module):
             lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
             lsq_addr, lsq_data, lsq_rob_id, lsq_done,
             lsq_head, lsq_tail,
+            # Phase 5: ROB Store 信息
+            rob_is_store, rob_lsq_id,
             issue_stage)
         
         execute_stage.async_called()
@@ -625,10 +627,10 @@ class MemoryStage(Module):
                         lsq_done[lsq_id] = UInt(1)(1)
                         log("MEM: Load LSQ[{}] from memory, data={:08x}", lsq_id, data_sram.dout[0])
                     with Condition(mem_write):
-                        # Store: 简化版，在 MEM 阶段直接写内存
-                        data_sram.build(we=UInt(1)(1), re=UInt(1)(0), addr=word_addr, wdata=write_data)
+                        # Phase 5 完整版: Store 不在 MEM 阶段写内存，只标记 done
+                        # Store 将在 Commit 阶段由 WriteBackStage 写入内存
                         lsq_done[lsq_id] = UInt(1)(1)
-                        log("MEM: Store LSQ[{}] addr={:08x} data={:08x}", lsq_id, addr_in, write_data)
+                        log("MEM: Store LSQ[{}] ready for commit, addr={:08x} data={:08x}", lsq_id, addr_in, write_data)
                 with Condition(~ex_mem_valid[0]):
                     mem_wb_mem_data[0] = UInt(XLEN)(0)
             mem_wb_control[0] = ex_mem_valid[0].select(control_in, UInt(CONTROL_LEN)(0))
@@ -662,6 +664,8 @@ class DispatchStage(Module):
               lsq_valid, lsq_is_store, lsq_addr_ready, lsq_data_ready,
               lsq_addr, lsq_data, lsq_rob_id, lsq_done,
               lsq_head, lsq_tail,
+              # Phase 5: ROB Store 信息
+              rob_is_store, rob_lsq_id,
               issue_stage):
         
         # 解析控制信号
@@ -736,6 +740,9 @@ class DispatchStage(Module):
             lsq_rob_id[lsq_id] = dispatch_rob_id
             lsq_done[lsq_id] = UInt(1)(0)
             lsq_tail[0] = lsq_next_tail
+            # Phase 5: 在 ROB 中记录 Store 信息（用于 Commit 阶段写内存）
+            rob_is_store[dispatch_rob_id] = is_store
+            rob_lsq_id[dispatch_rob_id] = lsq_id
             log("Dispatch: LSQ[{}] allocated, is_store={}, ROB[{}]", lsq_id, is_store, dispatch_rob_id)
         
         issue_stage.async_called()
@@ -899,8 +906,11 @@ class WriteBackStage(Module):
     def build(self, mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control,
               mem_wb_rob_id,  # Phase 2: ROB ID
               rob_head, rob_valid, rob_ready, rob_value, rob_dest,  # Phase 2: ROB arrays
+              rob_is_store, rob_lsq_id,  # Phase 5: Store info in ROB
               rat_valid, rat_tag,  # Phase 2: RAT for clearing on commit
               cdb_valid, cdb_tag, cdb_value,  # Phase 3: CDB
+              # Phase 5: LSQ for Store commit
+              lsq_valid, lsq_addr, lsq_data, lsq_head,
               reg_file, data_sram):
         mem_data_in = data_sram.dout[0]
         ex_result_in = mem_wb_ex_result[0]
@@ -948,6 +958,19 @@ class WriteBackStage(Module):
             # 释放 ROB 条目
             rob_valid[head_id] = UInt(1)(0)
             rob_ready[head_id] = UInt(1)(0)
+            
+            # Phase 5: Store Commit - 写入内存
+            with Condition(rob_is_store[head_id]):
+                store_lsq_id = rob_lsq_id[head_id]
+                store_addr = lsq_addr[store_lsq_id]
+                store_data = lsq_data[store_lsq_id]
+                word_addr = store_addr >> UInt(XLEN)(2)
+                data_sram.build(we=UInt(1)(1), re=UInt(1)(0), addr=word_addr, wdata=store_data)
+                # 释放 LSQ 条目
+                lsq_valid[store_lsq_id] = UInt(1)(0)
+                # 前移 LSQ head
+                lsq_head[0] = (store_lsq_id + UInt(LSQ_ID_BITS)(1)) & UInt(LSQ_ID_BITS)(LSQ_SIZE - 1)
+                log("Store Commit: ROB[{}] LSQ[{}] addr={:08x} data={:08x}", head_id, store_lsq_id, store_addr, store_data)
             
             # 前移 head
             rob_head[0] = (head_id + UInt(ROB_ID_BITS)(1)) & UInt(ROB_ID_BITS)(ROB_SIZE - 1)
@@ -1081,28 +1104,33 @@ class HazardUnit(Downstream):
                 md_busy[0] = UInt(1)(0)
                 log("Walk-back: MulDiv cleared (ROB[{}] invalid)", md_dest[0])
             
-            # Phase 5: Walk-back 时清理 LSQ
-            # 清除所有对应 ROB 被清除的 LSQ 条目
-            for i in range(LSQ_SIZE):
-                with Condition(lsq_valid[i] & ~rob_valid[lsq_rob_id[i]]):
-                    lsq_valid[i] = UInt(1)(0)
-                    log("Walk-back: LSQ[{}] cleared (ROB[{}] invalid)", UInt(LSQ_ID_BITS)(i), lsq_rob_id[i])
-
+            # Phase 5: Walk-back 时清理 LSQ 并精细回退 tail
+            # 策略：从 tail-1 向 head 方向扫描，找到第一个有效且 ROB 有效的条目
+            # 新 tail = 该条目 + 1；如果全部无效，则 tail = head
             
-            # Phase 5: Walk-back 时清理 LSQ
-            # 清除所有对应 ROB 被清除的 LSQ 条目
-            for i in range(LSQ_SIZE):
-                with Condition(lsq_valid[i] & ~rob_valid[lsq_rob_id[i]]):
-                    lsq_valid[i] = UInt(1)(0)
-                    log("Walk-back: LSQ[{}] cleared (ROB[{}] invalid)", UInt(LSQ_ID_BITS)(i), lsq_rob_id[i])
-
+            # 计算新 tail：遍历找最后一个有效条目
+            new_lsq_tail = lsq_head[0]  # 默认回退到 head（全空）
+            found_valid = UInt(1)(0)
             
-            # Phase 5: Walk-back 时清理 LSQ
+            for i in range(LSQ_SIZE):
+                idx = new_lsq_tail
+                # 条目有效且其 ROB 仍有效
+                entry_valid = lsq_valid[idx] & rob_valid[lsq_rob_id[idx]]
+                with Condition(entry_valid):
+                    # 更新 new_tail 为该条目的下一个位置
+                    next_pos = (idx + UInt(LSQ_ID_BITS)(1)) & UInt(LSQ_ID_BITS)(LSQ_SIZE - 1)
+                    new_lsq_tail = next_pos
+                    found_valid = UInt(1)(1)
+            
             # 清除所有对应 ROB 被清除的 LSQ 条目
             for i in range(LSQ_SIZE):
                 with Condition(lsq_valid[i] & ~rob_valid[lsq_rob_id[i]]):
                     lsq_valid[i] = UInt(1)(0)
                     log("Walk-back: LSQ[{}] cleared (ROB[{}] invalid)", UInt(LSQ_ID_BITS)(i), lsq_rob_id[i])
+            
+            # 精细回退 tail
+            lsq_tail[0] = new_lsq_tail
+            log("Walk-back: LSQ tail reset to {}, found_valid={}", new_lsq_tail, found_valid)
 
         log("RD_MEM={}, REG_WRITE_MEM={}, RD_WB={}, REG_WRITE_WB={}",
             rd_mem, reg_write_mem, rd_wb, reg_write_wb)
@@ -1184,6 +1212,8 @@ def build_cpu(program_file="test_program.txt"):
         rob_value = RegArray(UInt(XLEN), ROB_SIZE, initializer=[0]*ROB_SIZE)   # 执行结果
         rob_dest = RegArray(UInt(5), ROB_SIZE, initializer=[0]*ROB_SIZE)       # 目标寄存器号
         rob_pc = RegArray(UInt(XLEN), ROB_SIZE, initializer=[0]*ROB_SIZE)      # 指令PC
+        rob_is_store = RegArray(UInt(1), ROB_SIZE, initializer=[0]*ROB_SIZE)   # Phase 5: 是否为Store
+        rob_lsq_id = RegArray(UInt(LSQ_ID_BITS), ROB_SIZE, initializer=[0]*ROB_SIZE)  # Phase 5: LSQ ID
         # Walk-back 恢复所需字段
         rob_old_tag_valid = RegArray(UInt(1), ROB_SIZE, initializer=[0]*ROB_SIZE)  # 旧 RAT valid
         rob_old_tag = RegArray(UInt(ROB_ID_BITS), ROB_SIZE, initializer=[0]*ROB_SIZE)  # 旧 RAT tag
@@ -1289,8 +1319,11 @@ def build_cpu(program_file="test_program.txt"):
         writeback_signals = writeback_stage.build(mem_wb_valid, mem_wb_mem_data, mem_wb_ex_result, mem_wb_control,
                                                    mem_wb_rob_id,  # Phase 2
                                                    rob_head, rob_valid, rob_ready, rob_value, rob_dest,  # Phase 2
+                                                   rob_is_store, rob_lsq_id,  # Phase 5: Store info in ROB
                                                    rat_valid, rat_tag,  # Phase 2
                                                    cdb_valid, cdb_tag, cdb_value,  # Phase 3
+                                                   # Phase 5: LSQ for Store commit
+                                                   lsq_valid, lsq_addr, lsq_data, lsq_head,
                                                    reg_file, data_sram)
         # Phase 5: LSQ Store-to-Load 前递
         forward_hit, forward_data, load_blocked = lsq_unit.build(
